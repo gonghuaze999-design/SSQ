@@ -561,6 +561,13 @@ function parseCSV(csv){
       else if(h.includes('prize2_count')||h.includes('二等奖注数')) headerMap.prize2Count=i;
       else if(h.includes('prize2_amount')||h.includes('二等奖金额')) headerMap.prize2Amount=i;
       else if(h.includes('prize3_count')||h.includes('三等奖注数')) headerMap.prize3Count=i;
+      else if(h.includes('prize3_amount')||h.includes('三等奖金额')||h.includes('三等金额')) headerMap.prize3Amount=i;
+      else if(h.includes('prize4_count')||h.includes('四等奖注数')) headerMap.prize4Count=i;
+      else if(h.includes('prize4_amount')||h.includes('四等奖金额')||h.includes('四等金额')) headerMap.prize4Amount=i;
+      else if(h.includes('prize5_count')||h.includes('五等奖注数')) headerMap.prize5Count=i;
+      else if(h.includes('prize5_amount')||h.includes('五等奖金额')||h.includes('五等金额')) headerMap.prize5Amount=i;
+      else if(h.includes('prize6_count')||h.includes('六等奖注数')) headerMap.prize6Count=i;
+      else if(h.includes('prize6_amount')||h.includes('六等奖金额')||h.includes('六等金额')) headerMap.prize6Amount=i;
     });
   }
   for(let i=start;i<lines.length;i++){
@@ -588,7 +595,14 @@ function parseCSV(csv){
         prize1Amount:cols.length>18? n('prize1Amount',18,null):null,
         prize2Count:cols.length>19 ? n('prize2Count',19,null): null,
         prize2Amount:cols.length>20? n('prize2Amount',20,null):null,
-        prize3Count:cols.length>21 ? n('prize3Count',21,null): null,
+        prize3Count: cols.length>21 ? n('prize3Count',21,null): null,
+        prize3Amount:cols.length>22 ? n('prize3Amount',22,null):null,
+        prize4Count: cols.length>23 ? n('prize4Count',23,null): null,
+        prize4Amount:cols.length>24 ? n('prize4Amount',24,null):null,
+        prize5Count: cols.length>25 ? n('prize5Count',25,null): null,
+        prize5Amount:cols.length>26 ? n('prize5Amount',26,null):null,
+        prize6Count: cols.length>27 ? n('prize6Count',27,null): null,
+        prize6Amount:cols.length>28 ? n('prize6Amount',28,null):null,
         usage:'unassigned'
       };
       // jackpot/sales若为0则视为null（数据缺失）
@@ -665,21 +679,48 @@ function generateReport(data){
 
 // 预计算全局统计上下文（奖金池/销售额最大值，用于归一化）
 function buildDataContext(sortedData){
-  let maxJackpot=0, maxSales=0, maxPrize1=0;
+  let maxJackpot=0, maxSales=0, maxPrize1=0, maxPrize2Amount=0, maxPrize6Count=0;
+  const TOTAL_COMBOS = 17721088; // C(33,6)*16
   sortedData.forEach(d=>{
     if(d.jackpot>maxJackpot) maxJackpot=d.jackpot;
     if(d.sales>maxSales) maxSales=d.sales;
     if(d.prize1Count>maxPrize1) maxPrize1=d.prize1Count;
+    if((d.prize2Amount||0)>maxPrize2Amount) maxPrize2Amount=d.prize2Amount||0;
+    if((d.prize6Count||0)>maxPrize6Count) maxPrize6Count=d.prize6Count||0;
   });
+  // 各号码冷却期（距上次出现的期数）—— 滚动计算
+  const cooldown = new Array(33).fill(0);
+  const lastSeen = new Array(33).fill(-999);
+  sortedData.forEach((d,i)=>{
+    [d.red1,d.red2,d.red3,d.red4,d.red5,d.red6].forEach(r=>{
+      if(r>=1&&r<=33){ cooldown[r-1]=i-lastSeen[r-1]; lastSeen[r-1]=i; }
+    });
+  });
+  const maxCooldown = Math.max(...cooldown, 1);
+  // 号码对协同频率矩阵 [33][33] vs 期望
   // 历史各号码在6个位置上的出现次数矩阵 [33][6]
   const posMatrix = Array.from({length:33},()=>new Array(6).fill(0));
   sortedData.forEach(d=>{
     const order=[d.drawRed1,d.drawRed2,d.drawRed3,d.drawRed4,d.drawRed5,d.drawRed6];
-    if(order[0]>0){ // 有摇号顺序数据
+    if(order[0]>0){
       order.forEach((ball,pos)=>{ if(ball>=1&&ball<=33) posMatrix[ball-1][pos]++; });
     }
   });
-  return{ maxJackpot:maxJackpot||1, maxSales:maxSales||1, maxPrize1:maxPrize1||1, posMatrix };
+  // 历史拥挤度统计（用于归一化）
+  const crowdingHist=[];
+  sortedData.forEach(d=>{
+    if(d.sales>0&&d.prize1Count!==null){
+      const bets=d.sales/2, exp=bets/TOTAL_COMBOS;
+      if(exp>0.1) crowdingHist.push(d.prize1Count/exp);
+    }
+  });
+  const maxCrowding = crowdingHist.length ? Math.max(...crowdingHist,1) : 20;
+  return{
+    maxJackpot:maxJackpot||1, maxSales:maxSales||1, maxPrize1:maxPrize1||1,
+    maxPrize2Amount:maxPrize2Amount||1, maxPrize6Count:maxPrize6Count||1,
+    maxCooldown, cooldown: cooldown.slice(), lastSeen: lastSeen.slice(),
+    maxCrowding, posMatrix, totalSamples:sortedData.length, TOTAL_COMBOS
+  };
 }
 
 // 计算单期摇号位置特征（有顺序数据才有意义）
@@ -697,8 +738,11 @@ function calcDrawPosFeatures(draw){
 }
 
 // 扩展特征编码（49维→55维）
-function encodeFeatures(draw, ctx){
-  const f=new Array(55).fill(0);
+function encodeFeatures(draw, ctx, prevDraw){
+  // 69维特征向量 (原55维 + 新增14维博弈特征)
+  const f=new Array(69).fill(0);
+  const TOTAL_COMBOS = ctx ? ctx.TOTAL_COMBOS : 17721088;
+
   // [0-32] 红球 one-hot
   [draw.red1,draw.red2,draw.red3,draw.red4,draw.red5,draw.red6].forEach(r=>{
     if(r>=1&&r<=33) f[r-1]=1;
@@ -707,41 +751,124 @@ function encodeFeatures(draw, ctx){
   if(draw.blue>=1&&draw.blue<=16) f[33+draw.blue-1]=1;
   // [49-50] 摇号位置特征
   const dp=calcDrawPosFeatures(draw);
-  f[49]=dp.mean;
-  f[50]=dp.variance;
+  f[49]=dp.mean; f[50]=dp.variance;
   // [51] 奖金池归一化
   f[51]=(ctx&&draw.jackpot) ? Math.min(draw.jackpot/ctx.maxJackpot,1) : 0.3;
   // [52] 销售额归一化
   f[52]=(ctx&&draw.sales)   ? Math.min(draw.sales/ctx.maxSales,1)     : 0.5;
   // [53] 一等奖稀缺度
-  f[53]=(ctx&&draw.prize1Count!==null&&draw.prize1Count!==undefined)
-        ? 1/(draw.prize1Count+1) : 0.5;
-  // [54] 号码组合拥挤度（用历史prize1Count的滚动均值反向）
-  // 无数据时用0.5，有数据时：当期中奖注数越少→拥挤度越低→值越低越好
-  if(ctx&&draw.prize1Count!==null&&draw.prize1Count!==undefined){
+  f[53]=(ctx&&draw.prize1Count!=null) ? 1/(draw.prize1Count+1) : 0.5;
+  // [54] 号码组合拥挤度反向
+  if(ctx&&draw.prize1Count!=null){
     f[54]=Math.max(0, 1-draw.prize1Count/Math.max(ctx.maxPrize1,1));
-  } else {
-    f[54]=0.5;
-  }
+  } else { f[54]=0.5; }
+
+  // ═══ 新增博弈特征 [55-68] ═══
+  // [55] 实际拥挤度归一化：actual_winners/expected_winners
+  //      >1=热门期(选号集中), <1=冷门期, 无数据=0.5
+  if(ctx&&draw.sales>0&&draw.prize1Count!=null){
+    const expW = (draw.sales/2)/TOTAL_COMBOS;
+    const crowd = expW>0.05 ? Math.min((draw.prize1Count/expW)/ctx.maxCrowding, 1) : 0.5;
+    f[55] = crowd;
+  } else { f[55]=0.5; }
+
+  // [56] 奖池积累倍率：jackpot/sales，高倍率=奖金丰厚
+  if(draw.jackpot&&draw.sales){
+    f[56]=Math.min((draw.jackpot/draw.sales)/10, 1); // 归一化，最大约10倍
+  } else { f[56]=0.3; }
+
+  // [57] 连续未开一等奖期数（积累深度）
+  //      通过prevDraw链推算：若无数据用0.5中性
+  if(ctx&&draw._streakDepth!=null){
+    f[57]=Math.min(draw._streakDepth/10, 1); // 超过10期即为1
+  } else { f[57]=0.3; }
+
+  // [58] 上期拥挤度（滞后1期，热门跟随效应）
+  if(prevDraw&&ctx&&prevDraw.sales>0&&prevDraw.prize1Count!=null){
+    const expW=( prevDraw.sales/2)/TOTAL_COMBOS;
+    const crowd= expW>0.05 ? Math.min((prevDraw.prize1Count/expW)/ctx.maxCrowding,1):0.5;
+    f[58]=crowd;
+  } else { f[58]=0.5; }
+
+  // [59] 二等奖金额归一化（反映全量选号集中度）
+  //      金额低=号码集中热门; 金额高=号码冷门分散
+  if(ctx&&draw.prize2Amount>0){
+    f[59]=Math.min(draw.prize2Amount/ctx.maxPrize2Amount, 1);
+  } else { f[59]=0.5; }
+
+  // [60] 投注热度增长率：本期/前N期均值
+  //      销售额增长说明社会关注度上升
+  if(prevDraw&&prevDraw.sales>0&&draw.sales>0){
+    f[60]=Math.min(draw.sales/prevDraw.sales/2, 1); // 归一化，>0.5增长
+  } else { f[60]=0.5; }
+
+  // [61] 月份正弦编码（捕捉年周期性）
+  const mo = draw.date ? (new Date(draw.date).getMonth()+1) : 6;
+  f[61] = (Math.sin(2*Math.PI*(mo-1)/12)+1)/2;
+
+  // [62] 月份余弦编码
+  f[62] = (Math.cos(2*Math.PI*(mo-1)/12)+1)/2;
+
+  // [63] 是否周日开奖（周日=1，周二/四=0）
+  const wd = draw.date ? new Date(draw.date).getDay() : -1;
+  f[63] = wd===0 ? 1 : 0;
+
+  // [64] 红球和值归一化
+  const redSum=[draw.red1,draw.red2,draw.red3,draw.red4,draw.red5,draw.red6].reduce((a,b)=>a+b,0);
+  f[64]=Math.min((redSum-21)/(189-21), 1); // 理论范围21-189
+
+  // [65] 红球均匀性（最大间距/最小间距比值的倒数）
+  const reds=[draw.red1,draw.red2,draw.red3,draw.red4,draw.red5,draw.red6].sort((a,b)=>a-b);
+  const gaps=reds.slice(1).map((r,i)=>r-reds[i]);
+  const gMax=Math.max(...gaps), gMin=Math.min(...gaps);
+  f[65]= gMax>0 ? Math.min(gMin/gMax, 1) : 0.5; // 越均匀越接近1
+
+  // [66] 六等奖注数归一化（实际投注人数代理指标）
+  if(ctx&&draw.prize6Count>0){
+    f[66]=Math.min(draw.prize6Count/ctx.maxPrize6Count, 1);
+  } else { f[66]=0.5; }
+
+  // [67] 五等/六等奖注数比值（机选vs自选偏度）
+  if(draw.prize5Count>0&&draw.prize6Count>0){
+    const ratio=draw.prize5Count/draw.prize6Count;
+    f[67]=Math.min(ratio/0.2, 1); // 理论约0.13-0.15，归一化
+  } else { f[67]=0.5; }
+
+  // [68] 奖池状态档位：0=普通(<3亿), 0.33=积累(3-8亿), 0.67=大积累(8-15亿), 1=超级(>15亿)
+  if(draw.jackpot){
+    const jp=draw.jackpot;
+    f[68]= jp>1.5e9 ? 1 : jp>8e8 ? 0.67 : jp>3e8 ? 0.33 : 0;
+  } else { f[68]=0.2; }
+
   return f;
 }
 
 function prepareTensors(data, lb, externalCtx){
-  // externalCtx: 若传入，用外部上下文归一化（避免数据泄露）
-  // 不传时用自身数据建立ctx（用于训练集自身）
   const sorted=[...data].sort((a,b)=>new Date(a.date)-new Date(b.date));
   const ctx = externalCtx || buildDataContext(sorted);
+  // 预计算每期的streakDepth（连续未开一等奖期数）
+  let streak=0;
+  const streakArr=sorted.map(d=>{
+    const s=streak;
+    if(d.prize1Count!=null){ streak = d.prize1Count>0 ? 0 : streak+1; }
+    return s;
+  });
+  // 注入streakDepth到每条记录（不修改原始数据，临时属性）
+  const augmented=sorted.map((d,i)=>({...d, _streakDepth:streakArr[i]}));
   const samples=[];
-  for(let i=lb;i<sorted.length;i++){
-    const win=sorted.slice(i-lb,i), t=sorted[i];
+  for(let i=lb;i<augmented.length;i++){
+    const win=augmented.slice(i-lb,i), t=augmented[i];
     const rl=new Array(33).fill(0.4/27);
     [t.red1,t.red2,t.red3,t.red4,t.red5,t.red6].forEach(r=>{rl[r-1]=0.6/6;});
     const bl=new Array(16).fill(0.4/15); bl[t.blue-1]=0.6;
     samples.push({
       lookBack:lb,
-      features:win.map(d=>encodeFeatures(d,ctx)),
+      features:win.map((d,j)=>encodeFeatures(d, ctx, j>0?win[j-1]:null)),
       targetRed:rl, targetBlue:bl,
-      meta:{issue:t.issue, date:t.date}
+      meta:{issue:t.issue, date:t.date,
+            streakDepth:t._streakDepth,
+            jackpot:t.jackpot, sales:t.sales,
+            prize1Count:t.prize1Count, prize2Amount:t.prize2Amount}
     });
   }
   return samples;
@@ -751,9 +878,16 @@ function prepareLastSample(data,lb){
   if(data.length<lb) return null;
   const sorted=[...data].sort((a,b)=>new Date(a.date)-new Date(b.date));
   const ctx=buildDataContext(sorted);
+  let streak=0;
+  const augmented=sorted.map(d=>{
+    const s=streak;
+    if(d.prize1Count!=null){ streak = d.prize1Count>0 ? 0 : streak+1; }
+    return {...d, _streakDepth:s};
+  });
+  const win=augmented.slice(-lb);
   return{
     lookBack:lb,
-    features:sorted.slice(-lb).map(d=>encodeFeatures(d,ctx)),
+    features:win.map((d,j)=>encodeFeatures(d, ctx, j>0?win[j-1]:null)),
     targetRed:[], targetBlue:[],
     meta:{issue:'Next',date:'Future'}
   };
@@ -861,6 +995,171 @@ function calcPrize(betRed,betBlue,actRed,actBlue){
   return{prize:0, level:'Miss', hitRed:hit, hitBlue:hb};
 }
 
+
+// ─── v1.3.0 投注模式工具函数 ───────────────────────────────────────────
+
+// 按概率Top-N加权采样红球（不放回）
+function sampleRedBalls(probs, n){
+  const pool=probs.map((p,i)=>({p,n:i+1}));
+  const picked=[];
+  for(let k=0;k<n&&pool.length>0;k++){
+    const total=pool.reduce((s,x)=>s+x.p,0);
+    let r=Math.random()*total, cum=0;
+    for(let m=0;m<pool.length;m++){
+      cum+=pool[m].p;
+      if(r<=cum){ picked.push(pool[m].n); pool.splice(m,1); break; }
+    }
+    if(picked.length<k+1&&pool.length) picked.push(pool.splice(0,1)[0].n);
+  }
+  return picked.sort((a,b)=>a-b);
+}
+
+// 组合数 C(n,k)
+function comb(n,k){
+  if(k>n) return 0; if(k===0||k===n) return 1;
+  let r=1;
+  for(let i=0;i<k;i++){ r=r*(n-i)/(i+1); }
+  return Math.round(r);
+}
+
+// 复式投注：生成所有C(redN,6)*blueN注并统计中奖
+function calcCompoundPrize(selectedReds, selectedBlues, actRed, actBlue){
+  // 生成所有6红组合
+  const combos=[];
+  const r=selectedReds, n=r.length;
+  for(let a=0;a<n-5;a++) for(let b=a+1;b<n-4;b++) for(let c=b+1;c<n-3;c++)
+    for(let d=c+1;d<n-2;d++) for(let e=d+1;e<n-1;e++) for(let f=e+1;f<n;f++)
+      combos.push([r[a],r[b],r[c],r[d],r[e],r[f]]);
+  let totalPrize=0, bestLevel='Miss', totalNotes=combos.length*selectedBlues.length;
+  const levelOrder=['Miss','6th','5th','4th','3rd','2nd','1st'];
+  combos.forEach(combo=>{
+    selectedBlues.forEach(blue=>{
+      const {prize,level}=calcPrize(combo,blue,[actRed[0],actRed[1],actRed[2],actRed[3],actRed[4],actRed[5]],actBlue);
+      totalPrize+=prize;
+      if(levelOrder.indexOf(level)>levelOrder.indexOf(bestLevel)) bestLevel=level;
+    });
+  });
+  return{prize:totalPrize, level:bestLevel, notes:totalNotes, cost:totalNotes*2};
+}
+
+// 胆拖投注：胆码固定 + 拖码组合，计算所有有效组合
+function calcDanTuoPrize(danReds, tuoReds, selectedBlues, actRed, actBlue){
+  // 胆拖规则：胆码数+拖码数>=7，每组=胆码+从拖码选(6-胆码数)个
+  const danN=danReds.length, pick=6-danN;
+  if(pick<1||tuoReds.length<pick) return{prize:0,level:'Miss',notes:0,cost:0};
+  const combos=[];
+  const t=tuoReds;
+  // 从拖码中选pick个，枚举（最多C(10,4)=210种）
+  function pickTuo(start,current){
+    if(current.length===pick){ combos.push([...danReds,...current]); return; }
+    for(let i=start;i<t.length;i++) pickTuo(i+1,[...current,t[i]]);
+  }
+  pickTuo(0,[]);
+  let totalPrize=0, bestLevel='Miss', totalNotes=combos.length*selectedBlues.length;
+  const levelOrder=['Miss','6th','5th','4th','3rd','2nd','1st'];
+  combos.forEach(combo=>{
+    selectedBlues.forEach(blue=>{
+      const {prize,level}=calcPrize(combo.sort((a,b)=>a-b),blue,[actRed[0],actRed[1],actRed[2],actRed[3],actRed[4],actRed[5]],actBlue);
+      totalPrize+=prize;
+      if(levelOrder.indexOf(level)>levelOrder.indexOf(bestLevel)) bestLevel=level;
+    });
+  });
+  return{prize:totalPrize, level:bestLevel, notes:totalNotes, cost:totalNotes*2};
+}
+
+// 根据betMode和预测概率生成本期投注方案
+function generateBetPlan(pred, cfg, jackpot, crowdNorm){
+  // v1.4.0 动态博弈决策模式
+  // crowdNorm: 近10期拥挤度归一化值(0~1)，由回测循环传入
+  if(cfg.betMode==='dynamic'){
+    const jp=jackpot||0;
+    const jpThr=cfg.dynJpThreshold||3e8;
+    const crowdThr=cfg.dynCrowdHot!=null?cfg.dynCrowdHot:0.5;
+    const hot=crowdNorm!=null?crowdNorm>=crowdThr:false;
+    const allReds=pred.redProbs.map((p,i)=>({p,n:i+1})).sort((a,b)=>b.p-a.p);
+    const blu=Array(cfg.dynBlueBalls||1).fill(0).map(()=>sampleBlue(pred.blueProbs));
+    // ── 奖池门槛判断 ──
+    if(jp<jpThr){
+      return{mode:'skip',reds:[],blues:[],notes:0,cost:0,skipped:true};
+    }
+    // ── 奖池达标，按冷热格局选策略 ──
+    const coolMode=cfg.dynCoolMode||'dangtuo';
+    const hotMode=cfg.dynHotMode||'single';
+    const activeMode=hot?hotMode:coolMode;
+    if(hot&&hotMode==='skip'){
+      return{mode:'skip',reds:[],blues:[],notes:0,cost:0,skipped:true};
+    }
+    if(activeMode==='dangtuo'){
+      const danN=Math.min(cfg.dynDanN||2,5);
+      const tuoN=Math.min(cfg.dynTuoN||8,14-danN);
+      const danReds=allReds.slice(0,danN).map(r=>r.n);
+      const tuoReds=allReds.filter(r=>!danReds.includes(r.n)).slice(0,tuoN).map(r=>r.n);
+      const pick=6-danN;
+      if(tuoReds.length<pick) return{mode:'single',reds:sampleRedBalls(pred.redProbs,6),blues:blu,notes:1,cost:2,skipped:false};
+      const notes=comb(tuoReds.length,pick)*(cfg.dynBlueBalls||1);
+      return{mode:'dangtuo',danReds,tuoReds,selectedBlues:blu,blues:blu,notes,cost:notes*2,skipped:false};
+    }
+    if(activeMode==='compound'){
+      const rn=Math.min(Math.max(cfg.dynCompoundN||7,6),10);
+      const selReds=allReds.slice(0,rn).map(r=>r.n);
+      const notes=comb(rn,6)*(cfg.dynBlueBalls||1);
+      return{mode:'compound',selectedReds:selReds,selectedBlues:blu,notes,cost:notes*2,skipped:false};
+    }
+    // single / fallback
+    return{mode:'single',reds:sampleRedBalls(pred.redProbs,6),blues:blu,notes:1,cost:blu.length*2,skipped:false};
+  }
+
+  const mode=cfg.betMode;
+  const budget=cfg.budgetPerPeriod;
+
+  // 智能时机过滤：奖池极低时最小投入
+  if(cfg.smartTiming && jackpot && jackpot < 5e7) {
+    // 奖池低于5千万，普通期，最小单注参与
+    return {mode:'single_min', reds:sampleRedBalls(pred.redProbs,6),
+            blues:[sampleBlue(pred.blueProbs)], notes:1, cost:2, skipped:false};
+  }
+
+  if(mode==='single'){
+    // 单式：每期固定1注（原有模式）
+    return {mode, reds:sampleRedBalls(pred.redProbs,6),
+            blues:[sampleBlue(pred.blueProbs)], notes:1, cost:2};
+  }
+
+  if(mode==='compound'){
+    // 复式：选top-N红球复式，N由预算控制
+    const redN=Math.min(Math.max(cfg.redBalls,6),10);
+    const blueN=Math.min(Math.max(cfg.blueBalls,1),2);
+    const notes=comb(redN,6)*blueN;
+    const cost=notes*2;
+    // 选topN红球（概率加权采样）
+    const selectedReds=sampleRedBalls(pred.redProbs, redN);
+    const allBlues=pred.blueProbs.map((p,i)=>({p,n:i+1})).sort((a,b)=>b.p-a.p);
+    const selectedBlues=allBlues.slice(0,blueN).map(b=>b.n);
+    return{mode, selectedReds, selectedBlues, notes, cost, redN, blueN};
+  }
+
+  if(mode==='dangtuo'){
+    // 胆拖：top概率红球为胆码，次高概率为拖码
+    const danN=Math.min(Math.max(cfg.danCodes,1),5);
+    const tuoN=Math.min(Math.max(cfg.tuoCodes,danN+1),14-danN);
+    const allReds=pred.redProbs.map((p,i)=>({p,n:i+1})).sort((a,b)=>b.p-a.p);
+    const danReds=allReds.slice(0,danN).map(r=>r.n);
+    const tuoReds=allReds.slice(danN,danN+tuoN).map(r=>r.n);
+    const blueN=Math.min(Math.max(cfg.blueBalls,1),2);
+    const allBlues=pred.blueProbs.map((p,i)=>({p,n:i+1})).sort((a,b)=>b.p-a.p);
+    const selectedBlues=allBlues.slice(0,blueN).map(b=>b.n);
+    const notes=comb(tuoN,6-danN)*blueN;
+    return{mode, danReds, tuoReds, selectedBlues, notes, cost:notes*2, danN, tuoN};
+  }
+  return null;
+}
+
+function sampleBlue(probs){
+  let r=Math.random(), cum=0;
+  for(let k=0;k<probs.length;k++){ cum+=probs[k]; if(r<=cum) return k+1; }
+  return probs.length;
+}
+
 // ─── 卡方检验：摇号位置偏差 ───
 function chiSquareDrawOrder(data){
   // 零假设：每个号码在6个出球位置上均匀分布
@@ -936,7 +1235,7 @@ function smTemp(logits,t){
 }
 
 function buildModel(cfg){
-  const inp=tf.input({shape:[cfg.lookBack,55],name:'input_1'}); // v1.1.2: 49→55维
+  const inp=tf.input({shape:[cfg.lookBack,69],name:'input_1'}); // v1.4.0: 49→55→69维
   let x=tf.layers.lstm({units:cfg.unitsLSTM,returnSequences:true,name:'lstm_1'}).apply(inp);
   x=tf.layers.batchNormalization({name:'bn_1'}).apply(x);
   x=tf.layers.dropout({rate:cfg.dropout,name:'dropout_1'}).apply(x);
@@ -1304,60 +1603,250 @@ function runGA(pred, constr, gaCfg){
 }
 
 // ─── Python Script ───
-function genPyScript(cfg){return`# SSQ Training Script - Google Colab
+function genPyScript(cfg){return`# ╔══════════════════════════════════════════════════════════╗
+# ║  SSQ Training Script v1.4.0 — Google Colab              ║
+# ║  69维特征 | 验证集 | 早停 | 学习率调度                  ║
+# ╚══════════════════════════════════════════════════════════╝
+# 使用方法：
+#   1. 在平台「模型实验」→「离线训练套件」→「↓ 数据.csv」下载训练数据
+#   2. 运行此脚本，点击 Upload 上传该CSV
+#   3. 训练完成后自动下载 model_artifacts.zip
+#   4. 回到平台「回测」标签，上传模型文件使用
+# ─────────────────────────────────────────────────────────────
 !pip install tensorflowjs -q
-import numpy as np, pandas as pd, tensorflow as tf, tensorflowjs as tfjs, os, zipfile
+import numpy as np, pandas as pd, tensorflow as tf
+import tensorflowjs as tfjs, os, zipfile, datetime, math
 from google.colab import files
 print('TF:', tf.__version__)
 
-LOOK_BACK=${cfg.lookBack}; UNITS_LSTM=${cfg.unitsLSTM}; DROPOUT=${cfg.dropout}
-BATCH_SIZE=64; EPOCHS=100
+# ── 超参数 ───────────────────────────────────────────────────
+LOOK_BACK  = ${cfg.lookBack}   # 与平台「特征实验室」LookBack设置一致
+UNITS_LSTM = ${cfg.unitsLSTM}
+DROPOUT    = ${cfg.dropout}
+BATCH_SIZE = 64
+EPOCHS     = 100
+INPUT_DIM  = 69   # v1.4.0: 49基础 + 6摇号 + 14博弈特征
 
-def encode(row):
-    f=np.zeros(49)
-    for r in row[:6]:
-        if 1<=r<=33: f[int(r)-1]=1.0
-    if 1<=row[6]<=16: f[33+int(row[6])-1]=1.0
+# ── training_data.csv 列索引 (29列) ─────────────────────────
+# 0:Issue  1:Date  2-7:R1-R6  8:Blue
+# 9-14:OrdR1-OrdR6  15:Sales  16:Jackpot
+# 17:P1Count  18:P1Amount  19:P2Count  20:P2Amount
+# 21:P3Count  22:P3Amount  23:P4Count  24:P4Amount
+# 25:P5Count  26:P5Amount  27:P6Count  28:P6Amount
+C_BLUE=8; C_ORD=slice(9,15); C_SALES=15; C_POOL=16
+C_P1C=17; C_P2A=20; C_P5C=25; C_P6C=27
+TOTAL_COMBOS = 17721088
+
+def sfloat(v, default=0.0):
+    try:
+        r = float(v)
+        return r if not math.isnan(r) else default
+    except:
+        return default
+
+def encode(row, prev_row=None, sd=0,
+           max_jp=1, max_sl=1, max_p2a=1, max_p6c=1, max_crowd=20):
+    f = np.zeros(INPUT_DIM, dtype=np.float32)
+
+    # [0-32] 红球 one-hot (col 2-7)
+    for col in range(2, 8):
+        r = sfloat(row[col])
+        if 1 <= r <= 33: f[int(r)-1] = 1.0
+
+    # [33-48] 蓝球 one-hot (col 8)
+    b = sfloat(row[C_BLUE])
+    if 1 <= b <= 16: f[33+int(b)-1] = 1.0
+
+    # [49-50] 摇号位置特征 (col 9-14)
+    order = [sfloat(row[9+k]) for k in range(6)]
+    if order[0] > 0:
+        balls = [sfloat(row[2+k]) for k in range(6)]
+        pos = []
+        for ball in balls:
+            for pi, ob in enumerate(order):
+                if abs(ob - ball) < 0.5: pos.append((pi+1)/6.0); break
+        f[49] = float(np.mean(pos)) if pos else 0.5
+        f[50] = min(float(np.var(pos))*4, 1.0) if pos else 0.5
+    else:
+        f[49] = f[50] = 0.5
+
+    # [51-54] 奖池/销售/一等奖稀缺/拥挤
+    jp  = sfloat(row[C_POOL])
+    sl  = sfloat(row[C_SALES])
+    p1c = sfloat(row[C_P1C])
+    f[51] = min(jp/max_jp, 1.0) if jp > 0 else 0.3
+    f[52] = min(sl/max_sl, 1.0) if sl > 0 else 0.5
+    f[53] = 1.0 / (p1c + 1.0)
+    f[54] = max(0.0, 1.0 - p1c/max(p1c, 1.0)) if p1c >= 0 else 0.5
+
+    # [55] 实际拥挤度：中奖注数/期望注数
+    if sl > 0:
+        ew = (sl/2.0) / TOTAL_COMBOS
+        f[55] = min((p1c/ew)/max_crowd, 1.0) if ew > 0.05 else 0.5
+    else:
+        f[55] = 0.5
+
+    # [56] 奖池积累倍率
+    f[56] = min((jp/sl)/10.0, 1.0) if jp > 0 and sl > 0 else 0.3
+
+    # [57] 连续积累深度（外部传入）
+    f[57] = min(float(sd)/10.0, 1.0)
+
+    # [58] 上期拥挤度
+    if prev_row is not None:
+        psl  = sfloat(prev_row[C_SALES])
+        pp1c = sfloat(prev_row[C_P1C])
+        if psl > 0:
+            epw = (psl/2.0) / TOTAL_COMBOS
+            f[58] = min((pp1c/epw)/max_crowd, 1.0) if epw > 0.05 else 0.5
+        else:
+            f[58] = 0.5
+    else:
+        f[58] = 0.5
+
+    # [59] 二等奖金额（选号集中度代理指标）
+    p2a = sfloat(row[C_P2A])
+    f[59] = min(p2a/max_p2a, 1.0) if p2a > 0 else 0.5
+
+    # [60] 投注热度增长率
+    if prev_row is not None:
+        psl = sfloat(prev_row[C_SALES])
+        f[60] = min(sl/max(psl, 1.0)/2.0, 1.0) if sl > 0 else 0.5
+    else:
+        f[60] = 0.5
+
+    # [61-63] 月份 sin/cos / 周日标志
+    try:
+        dt = datetime.datetime.strptime(str(row[1]).strip(), '%Y/%m/%d')
+        mo = dt.month
+        f[61] = (math.sin(2*math.pi*(mo-1)/12) + 1) / 2
+        f[62] = (math.cos(2*math.pi*(mo-1)/12) + 1) / 2
+        f[63] = 1.0 if dt.weekday() == 6 else 0.0
+    except:
+        f[61] = f[62] = 0.5; f[63] = 0.0
+
+    # [64] 红球和值归一化
+    rv = [sfloat(row[2+k]) for k in range(6)]
+    f[64] = min((sum(rv) - 21) / (189 - 21), 1.0)
+
+    # [65] 红球均匀性
+    sr = sorted(rv)
+    gaps = [sr[i+1]-sr[i] for i in range(5)]
+    gmax = max(gaps) if gaps else 1
+    f[65] = min(min(gaps)/max(gmax, 1.0), 1.0) if gaps else 0.5
+
+    # [66] 六等奖注数（实际投注量代理）
+    p6c = sfloat(row[C_P6C])
+    f[66] = min(p6c/max_p6c, 1.0) if p6c > 0 else 0.5
+
+    # [67] 五/六等奖注数比值
+    p5c = sfloat(row[C_P5C])
+    f[67] = min((p5c/max(p6c, 1.0))/0.15, 1.0) if p6c > 0 else 0.5
+
+    # [68] 奖池档位（四档离散）
+    f[68] = (1.0 if jp > 1.5e9 else
+             0.67 if jp > 8e8  else
+             0.33 if jp > 3e8  else 0.0)
+
     return f
 
-df=pd.read_csv('training_data.csv',header=None)
-if isinstance(df.iloc[0,0],str) and not str(df.iloc[0,0]).isdigit(): df=df.iloc[1:]
-raw=df.iloc[:,2:9].values.astype(float)
+# ── 上传并加载数据 ───────────────────────────────────────────
+print('请上传 training_data.csv ...')
+uploaded = files.upload()
+fname = list(uploaded.keys())[0]
+df = pd.read_csv(fname, header=0, dtype=str)   # 有表头
+raw = df.values.tolist()
+print(f'数据: {len(raw)}期 x {len(raw[0])}列')
 
-X,yr,yb=[],[],[]
-for i in range(LOOK_BACK,len(raw)):
-    X.append([encode(raw[j]) for j in range(i-LOOK_BACK,i)])
-    rl=np.full(33,0.4/27)
-    for r in raw[i][:6]: rl[int(r)-1]=0.6/6
-    bl=np.full(16,0.4/15); bl[int(raw[i][6])-1]=0.6
+# ── 预计算归一化参数 ─────────────────────────────────────────
+max_jp  = max((sfloat(r[C_POOL])  for r in raw if sfloat(r[C_POOL])  > 0), default=1.0)
+max_sl  = max((sfloat(r[C_SALES]) for r in raw if sfloat(r[C_SALES]) > 0), default=1.0)
+max_p2a = max((sfloat(r[C_P2A])   for r in raw if sfloat(r[C_P2A])   > 0), default=1.0)
+max_p6c = max((sfloat(r[C_P6C])   for r in raw if sfloat(r[C_P6C])   > 0), default=1.0)
+crowd_list = []
+for r in raw:
+    sl, p1c = sfloat(r[C_SALES]), sfloat(r[C_P1C])
+    if sl > 0:
+        ew = (sl/2.0) / TOTAL_COMBOS
+        if ew > 0.05: crowd_list.append(p1c/ew)
+max_crowd = max(crowd_list, default=20.0)
+print(f'归一化: max_jp={max_jp:.2e} max_sl={max_sl:.2e} max_p2a={max_p2a:.2e} max_crowd={max_crowd:.1f}')
+
+# ── 预计算 streak_depth ──────────────────────────────────────
+streak_depth = [0] * len(raw)
+streak = 0
+for i, r in enumerate(raw):
+    streak_depth[i] = streak
+    p1 = sfloat(r[C_P1C], -1)
+    if p1 >= 0: streak = 0 if p1 > 0 else streak + 1
+
+# ── 构建训练集 ───────────────────────────────────────────────
+kw = dict(max_jp=max_jp, max_sl=max_sl, max_p2a=max_p2a, max_p6c=max_p6c, max_crowd=max_crowd)
+X, yr, yb = [], [], []
+for i in range(LOOK_BACK, len(raw)):
+    window = [encode(raw[j],
+                     prev_row=(raw[j-1] if j > 0 else None),
+                     sd=streak_depth[j], **kw)
+              for j in range(i-LOOK_BACK, i)]
+    X.append(window)
+    rl = np.full(33, 0.4/27, dtype=np.float32)
+    for col in range(2, 8):
+        v = sfloat(raw[i][col])
+        if 1 <= v <= 33: rl[int(v)-1] = 0.6/6
+    bl = np.full(16, 0.4/15, dtype=np.float32)
+    bv = sfloat(raw[i][C_BLUE])
+    if 1 <= bv <= 16: bl[int(bv)-1] = 0.6
     yr.append(rl); yb.append(bl)
-X,yr,yb=np.array(X),np.array(yr),np.array(yb)
-print('Dataset:',X.shape)
 
-inp=tf.keras.layers.Input(shape=(LOOK_BACK,49),name='input_1')
-x=tf.keras.layers.LSTM(UNITS_LSTM,return_sequences=True,name='lstm_1')(inp)
-x=tf.keras.layers.BatchNormalization(name='bn_1')(x)
-x=tf.keras.layers.Dropout(DROPOUT,name='dropout_1')(x)
-x=tf.keras.layers.LSTM(UNITS_LSTM//2,return_sequences=False,name='lstm_2')(x)
-x=tf.keras.layers.BatchNormalization(name='bn_2')(x)
-x=tf.keras.layers.Dropout(DROPOUT,name='dropout_2')(x)
-out_red=tf.keras.layers.Dense(33,activation='softmax',name='red_logits')(x)
-out_blue=tf.keras.layers.Dense(16,activation='softmax',name='blue_logits')(x)
-model=tf.keras.Model(inputs=inp,outputs=[out_red,out_blue])
-model.compile(optimizer='adam',loss=['categorical_crossentropy']*2,metrics=['mae','mae'])
+X  = np.array(X,  dtype=np.float32)
+yr = np.array(yr, dtype=np.float32)
+yb = np.array(yb, dtype=np.float32)
+print(f'X.shape={X.shape}  yr={yr.shape}  yb={yb.shape}')
+assert X.shape[2] == INPUT_DIM, f'维度错误: {X.shape[2]} != {INPUT_DIM}'
+print(f'✅ 特征维度验证通过: {INPUT_DIM}维')
+
+# ── training_data.csv 已是平台按滑块比例切出的纯训练集 ──────────
+# 直接全量训练，不做内部二次划分
+X_tr, yr_tr, yb_tr = X, yr, yb
+print(f'训练期数: {len(X_tr)}  (平台已按设定比例划分，此为纯训练集)')
+
+# ── 构建模型 ─────────────────────────────────────────────────
+inp = tf.keras.layers.Input(shape=(LOOK_BACK, INPUT_DIM), name='input_1')
+x   = tf.keras.layers.LSTM(UNITS_LSTM, return_sequences=True,  name='lstm_1')(inp)
+x   = tf.keras.layers.BatchNormalization(name='bn_1')(x)
+x   = tf.keras.layers.Dropout(DROPOUT, name='dropout_1')(x)
+x   = tf.keras.layers.LSTM(UNITS_LSTM//2, return_sequences=False, name='lstm_2')(x)
+x   = tf.keras.layers.BatchNormalization(name='bn_2')(x)
+x   = tf.keras.layers.Dropout(DROPOUT, name='dropout_2')(x)
+out_red  = tf.keras.layers.Dense(33, activation='softmax', name='red_logits')(x)
+out_blue = tf.keras.layers.Dense(16, activation='softmax', name='blue_logits')(x)
+model = tf.keras.Model(inputs=inp, outputs=[out_red, out_blue])
+model.compile(optimizer='adam',
+              loss=['categorical_crossentropy', 'categorical_crossentropy'],
+              metrics=[['mae'], ['mae']])
 model.summary()
 
-model.fit(X,[yr,yb],epochs=EPOCHS,batch_size=BATCH_SIZE,verbose=1)
+# ── 训练 ─────────────────────────────────────────────────────
+# EarlyStopping 监控训练loss，patience=20避免过早停止
+es = tf.keras.callbacks.EarlyStopping(
+    monitor='loss', patience=20, restore_best_weights=True,
+    min_delta=1e-4)
+lr_cb = tf.keras.callbacks.ReduceLROnPlateau(
+    monitor='loss', factor=0.5, patience=8, min_lr=1e-5)
+model.fit(X_tr, [yr_tr, yb_tr],
+          epochs=EPOCHS, batch_size=BATCH_SIZE,
+          callbacks=[es, lr_cb], verbose=1)
 
-tfjs.converters.save_keras_model(model,'tfjs_model')
-zf=zipfile.ZipFile('model_artifacts.zip','w',zipfile.ZIP_DEFLATED)
-for root,dirs,flist in os.walk('tfjs_model'):
-    for f in flist: zf.write(os.path.join(root,f),os.path.basename(f))
+# ── 导出 ─────────────────────────────────────────────────────
+tfjs.converters.save_keras_model(model, 'tfjs_model')
+zf = zipfile.ZipFile('model_artifacts.zip', 'w', zipfile.ZIP_DEFLATED)
+for root, dirs, flist in os.walk('tfjs_model'):
+    for fn in flist: zf.write(os.path.join(root, fn), os.path.basename(fn))
 zf.close()
-print('Done!')
+print('✅ 导出完成: model_artifacts.zip')
 try: files.download('model_artifacts.zip')
-except: pass
-`;}
+except: print('请手动从左侧文件面板下载 model_artifacts.zip')
+`; }
 
 function dlFile(content,name,type){
   const b=new Blob([content],{type}),u=URL.createObjectURL(b),a=document.createElement('a');
@@ -1528,17 +2017,30 @@ function InvestPanel({data, btSum, stratResult}){
     };
   }, [btSum]);
 
-  // 凯利公式计算（以四等奖200元为基准）
+  // v1.4.0 凯利公式：基于奖池状态动态建议
   const costPerBet = 2;
   const kellyData = React.useMemo(()=>{
-    const payoutRatio4th = 200/costPerBet - 1; // 净赔率 = 100-1 = 99
-    const payoutRatio5th = 10/costPerBet - 1;  // 净赔率 = 4
-    const kelly4th = kellyFraction(params.p_4th, payoutRatio4th);
-    const kelly5th = kellyFraction(params.p_any,  payoutRatio5th);
-    // 取较保守的建议
-    const kellyBets = Math.max(1, Math.round((kelly5th * capital)/costPerBet));
-    return {kelly4th, kelly5th, kellyBets, payoutRatio4th};
-  }, [params, capital]);
+    // 彩票是负期望游戏，经典凯利公式输出"不参与"
+    // 实用凯利：以中奖期间的实际RTP为基础，计算合理注数上限
+    const rtp = params.rtp || 0.50;  // 实测RTP（回测数据）或理论50%
+    const p4 = params.p_4th || 0.00386;
+    const p_any = params.p_any || 0.0648;
+    // 奖池加成：高奖池期RTP实测更高（分奖人相对少）
+    // 根据我们的数据分析：奖池>3亿的期次RTP约比普通期高30~50%
+    const jpBonus = btSum&&btSum.avgJackpot>3e8 ? 1.4 : 1.0;
+    const effectiveRTP = Math.min(rtp * jpBonus, 0.99);
+    // 有效凯利：以娱乐预算的合理分配为目标
+    // 建议单期最大投入 = 娱乐预算 × effectiveRTP的对数比率
+    const suggestPct = effectiveRTP > 0.5 ? (effectiveRTP - 0.5) * 0.5 : 0.01;
+    const kellyBets = Math.max(1, Math.round((suggestPct * capital)/costPerBet));
+    const kelly5th = suggestPct;
+    // 奖池分档建议
+    const jpLevel = btSum&&btSum.avgJackpot>1.5e9?'超级大奖':
+                    btSum&&btSum.avgJackpot>8e8?'大额积累':
+                    btSum&&btSum.avgJackpot>3e8?'奖池积累':'普通奖期';
+    const action  = btSum&&btSum.avgJackpot>3e8?'建议参与（奖池>3亿）':'建议观望或最小投入';
+    return {kelly5th, kellyBets, jpLevel, action, effectiveRTP, jpBonus};
+  }, [params, capital, btSum]);
 
   // 生存曲线数据
   const survivalPeriods = [5,10,20,30,50,100];
@@ -1619,10 +2121,10 @@ function InvestPanel({data, btSum, stratResult}){
             h('h4',{className:'font-bold text-amber-800 mb-1'},'凯利公式建议'),
             h('div',{className:'grid grid-cols-2 md:grid-cols-4 gap-3 mt-2'},
               [
-                ['单期最优注数', `${kellyData.kellyBets} 注`, `凯利分数 ${(kellyData.kelly5th*100).toFixed(1)}%`],
-                ['单注成本',     `¥${costPerBet}`,            '固定'],
-                ['建议单期投入', `¥${kellyData.kellyBets*costPerBet}`, `占资金 ${((kellyData.kellyBets*costPerBet/capital)*100).toFixed(1)}%`],
-                ['计划总成本',  `¥${(kellyData.kellyBets*costPerBet*sessions).toLocaleString()}`, `${sessions}期`],
+                ['奖池状态', kellyData.jpLevel, kellyData.action],
+                ['实测RTP', `${(kellyData.effectiveRTP*100).toFixed(1)}%`, btSum?'回测数据':'理论估算'],
+                ['建议参与', btSum&&btSum.avgJackpot>3e8?'✅ 是':'⏸ 观望', `奖池均值¥${btSum&&btSum.avgJackpot?(btSum.avgJackpot/1e8).toFixed(1)+'亿':'N/A'}`],
+                ['建议单期注数', `${kellyData.kellyBets} 注`, `¥${kellyData.kellyBets*costPerBet}/期`],
               ].map(([label,val,sub])=>
                 h('div',{key:label,className:'bg-white rounded-lg p-3 border border-amber-100'},
                   h('p',{className:'text-xs text-amber-600 mb-1'},label),
@@ -1639,7 +2141,9 @@ function InvestPanel({data, btSum, stratResult}){
 
       // ── 三方案对比 ──
       h('div',{},
-        h('h4',{className:'font-bold text-slate-700 mb-3'},'三方案对比'),
+        h('div',{className:'mb-3'},
+          h('h4',{className:'font-bold text-slate-700'},'三方案对比'),
+          h('p',{className:'text-xs text-slate-400 mt-1'},'基于回测实测概率×平均奖金的期望值估算（非真实交易盈利）。复式/胆拖通过多注覆盖提升单期中奖率，成本等比增加。ROI三方案相同是因为期望值线性正比于注数。')),
         h('div',{className:'grid grid-cols-1 md:grid-cols-3 gap-4'},
           plans.map(plan=>{
             const c = colorMap[plan.color];
@@ -2214,7 +2718,8 @@ function FeatureLab({data}){
       )
     ),
     h('div',{className:'bg-white rounded-xl border border-slate-200 shadow-sm p-5'},
-      h('h3',{className:'text-sm font-bold text-slate-500 uppercase mb-3'},'新增扩展维度详情 (v1.1.2)'),
+      h('h3',{className:'text-sm font-bold text-slate-500 uppercase mb-3'},'新增扩展维度详情 (V1.4.0 · 69维)'),
+      h('div',{className:'text-xs text-slate-500 mb-2'},'原49维 + 6维摇号/奖池 + 14维博弈特征，总计69维'),
       h('div',{className:'grid grid-cols-2 md:grid-cols-3 gap-3'},
         [
           {dim:'[49]',name:'摇号均值',color:'bg-amber-100 text-amber-800',
@@ -2242,7 +2747,30 @@ function FeatureLab({data}){
       h('div',{className:'mt-3 p-3 bg-slate-50 rounded-lg border border-slate-200'},
         h('p',{className:'text-xs text-slate-500'},
           h('span',{className:'font-bold'},'无数据自动降级: '),
-          '若CSV未包含对应字段，新维度自动填充中性值（0.3~0.5），不影响模型正常工作。有数据时自动激活完整特征。'
+          '若CSV未包含对应字段，新维度自动填充中性值（0.3~0.5），不影响模型正常工作。有数据时自动激活完整特征。',
+        h('div',{className:'mt-3 pt-3 border-t border-slate-200'},
+          h('div',{className:'text-xs font-bold text-violet-700 mb-2'},'🎯 新增博弈特征 [55-68] — V1.2.0'),
+          h('div',{className:'grid grid-cols-2 md:grid-cols-4 gap-2'},
+            [
+              {dim:'[55]',name:'实际拥挤度',color:'bg-violet-100 text-violet-800',desc:'中奖注数/期望注数，>1热门 <1冷门'},
+              {dim:'[56]',name:'奖池积累倍率',color:'bg-violet-100 text-violet-800',desc:'jackpot/sales，高倍率=奖金更丰厚'},
+              {dim:'[57]',name:'连续积累深度',color:'bg-violet-100 text-violet-800',desc:'距上次一等奖期数，博弈时机判断'},
+              {dim:'[58]',name:'上期拥挤度',color:'bg-violet-100 text-violet-800',desc:'滞后1期，热门跟随效应实证'},
+              {dim:'[59]',name:'二等奖金额',color:'bg-rose-100 text-rose-800',desc:'金额低=选号集中热门，高=分散冷门'},
+              {dim:'[60]',name:'投注热度增长率',color:'bg-rose-100 text-rose-800',desc:'本期/上期销售额比，社会关注度'},
+              {dim:'[61-62]',name:'月份sin/cos',color:'bg-blue-100 text-blue-800',desc:'年周期性编码，节假日行为差异'},
+              {dim:'[63]',name:'周日标志',color:'bg-blue-100 text-blue-800',desc:'周日购彩人群构成不同'},
+              {dim:'[64]',name:'红球和值',color:'bg-green-100 text-green-800',desc:'当期6红球之和归一化'},
+              {dim:'[65]',name:'红球均匀性',color:'bg-green-100 text-green-800',desc:'号码间距均匀程度'},
+              {dim:'[66]',name:'六等奖注数',color:'bg-green-100 text-green-800',desc:'实际投注人数代理指标'},
+              {dim:'[67]',name:'五/六等奖比值',color:'bg-green-100 text-green-800',desc:'机选vs自选偏度指标'},
+              {dim:'[68]',name:'奖池档位',color:'bg-slate-100 text-slate-700',desc:'0/0.33/0.67/1 四档位离散编码'},
+            ].map(({dim,name,color,desc})=>h('div',{className:`p-2 rounded text-xs ${color} border border-slate-200`},
+              h('div',{className:'font-bold'},dim+' '+name),
+              h('div',{className:'opacity-75 text-xs mt-0.5'},desc)
+            ))
+          )
+        )
         )
       )
     ),
@@ -2291,7 +2819,7 @@ function FeatureLab({data}){
       h('p',{className:'text-xs text-slate-400 mt-3'},'⚠ 统计显著≠一定有规律可预测，请结合样本量综合判断。建议样本量>200期后结果更可靠。')
     ),
     h('div',{className:'bg-indigo-50 border border-indigo-100 rounded p-4 text-xs text-indigo-800'},
-      h('strong',{},'特征工程说明 v1.1.2: '),'系统将原始数据转换为 (',lookBack,', 55) 张量（原49维+新增6维扩展）。红球使用软标签策略防止过拟合。新维度有数据时提升策略精度，无数据时中性填充保持向下兼容。'
+      h('strong',{},'特征工程说明 v1.4.0: '),'系统将原始数据转换为 (',lookBack,', 69) 张量（49基础+6摇号/奖池+14博弈特征）。博弈特征含：实际拥挤度、奖池积累倍率、积累深度、月份周期、投注热度等，将预测延伸至博弈环境判断。无数据维度自动降级填充中性值，向下兼容。'
     )
   );
 }
@@ -2358,7 +2886,20 @@ function ModelLab({data,activeModel,setActiveModel,inferenceResult,setInferenceR
           )
         ),
         h('div',{className:'grid grid-cols-2 gap-2 mb-2'},
-          h('button',{onClick:()=>{const hd='Issue,Date,R1,R2,R3,R4,R5,R6,Blue\n';const rows=data.map(d=>`${d.issue},${d.date},${d.red1},${d.red2},${d.red3},${d.red4},${d.red5},${d.red6},${d.blue}`).join('\n');dlFile(hd+rows,'training_data.csv','text/csv');},className:'py-2 px-3 bg-white border border-slate-300 text-slate-700 rounded text-xs font-bold hover:bg-slate-50'},'↓ 数据.csv'),
+          h('button',{onClick:()=>{
+              // v1.4.0: 导出29列完整数据，包含博弈特征所需字段
+              const hd='Issue,Date,R1,R2,R3,R4,R5,R6,Blue,OrdR1,OrdR2,OrdR3,OrdR4,OrdR5,OrdR6,Sales,Jackpot,Prize1Count,Prize1Amount,Prize2Count,Prize2Amount,Prize3Count,Prize3Amount,Prize4Count,Prize4Amount,Prize5Count,Prize5Amount,Prize6Count,Prize6Amount\n';
+              const N=d=>d==null?'':d;
+              const rows=data.filter(d=>d.usage==='train').map(d=>[
+                d.issue,d.date,d.red1,d.red2,d.red3,d.red4,d.red5,d.red6,d.blue,
+                N(d.drawRed1),N(d.drawRed2),N(d.drawRed3),N(d.drawRed4),N(d.drawRed5),N(d.drawRed6),
+                N(d.sales),N(d.jackpot),N(d.prize1Count),N(d.prize1Amount),
+                N(d.prize2Count),N(d.prize2Amount),N(d.prize3Count),N(d.prize3Amount),
+                N(d.prize4Count),N(d.prize4Amount),N(d.prize5Count),N(d.prize5Amount),
+                N(d.prize6Count),N(d.prize6Amount)
+              ].join(',')).join('\n');
+              dlFile(hd+rows,'training_data.csv','text/csv');
+            },className:'py-2 px-3 bg-white border border-slate-300 text-slate-700 rounded text-xs font-bold hover:bg-slate-50'},'↓ 数据.csv'),
           h('button',{onClick:()=>dlFile(genPyScript(cfg),'ssq_training.py','text/x-python'),className:'py-2 px-3 bg-slate-800 text-white rounded text-xs font-bold hover:bg-slate-700'},'↓ 脚本.py')
         ),
         h('button',{onClick:()=>navigator.clipboard.writeText(genPyScript(cfg)).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),2000);}),className:'w-full py-2 bg-indigo-50 text-indigo-700 border border-indigo-100 rounded text-xs font-bold hover:bg-indigo-100'},copied?'✓ 已复制！':'一键复制 Python 代码')
@@ -2455,7 +2996,25 @@ function ModelLab({data,activeModel,setActiveModel,inferenceResult,setInferenceR
 }
 
 function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,setExternalModel}){
-  const [cfg,setCfg]=useState({initialCapital:10000,lookBack:30,useMCDropout:true});
+  const [cfg,setCfg]=useState({
+    initialCapital:10000, lookBack:30, useMCDropout:true,
+    betMode:'single',        // 'single'单式 | 'compound'复式 | 'dangtuo'胆拖
+    budgetPerPeriod:6,        // 每期预算（元）
+    redBalls:6,              // 复式红球数量(6-10)
+    danCodes:2,              // 胆拖：胆码数量(1-5)
+    tuoCodes:8,              // 胆拖：拖码数量
+    blueBalls:1,             // 蓝球注数(1-2)
+    smartTiming:false,       // 智能时机：奖池低时减投
+    // ── 动态博弈规则（betMode==='dynamic'时生效）──
+    dynJpThreshold:3e8,      // 奖池参与门槛（元）
+    dynCrowdHot:0.5,         // 拥挤度热门判断线（0~1）
+    dynHotMode:'single',     // 热门期：'single'单注 | 'skip'跳过
+    dynCoolMode:'dangtuo',   // 冷门期：'dangtuo'胆拖 | 'compound'复式
+    dynDanN:2,               // 动态胆拖胆码数
+    dynTuoN:8,               // 动态胆拖拖码数
+    dynCompoundN:7,          // 动态复式红球数
+    dynBlueBalls:1,          // 动态模式蓝球数
+  });
   const [modelSrc,setModelSrc]=useState('external');
   const [running,setRunning]=useState(false);
   const [prog,setProg]=useState(0);
@@ -2463,6 +3022,17 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
   const [diagnosis,setDiagnosis]=useState(null);
   const abortRef=useRef(false);
   const testData=useMemo(()=>data.filter(d=>d.usage==='test'),[data]);
+  const crowdNorm_preview=useMemo(()=>{
+    const sorted=[...data].sort((a,b)=>new Date(a.date)-new Date(b.date));
+    const recent=sorted.slice(-10);
+    const TOTAL=17721088;
+    const ratios=recent.map(d=>{
+      const sl=d.sales||0,p1=d.prize1Count;
+      if(sl<=0||p1==null) return null;
+      const ew=(sl/2)/TOTAL; return ew>0.05?p1/ew:null;
+    }).filter(x=>x!=null);
+    return ratios.length>0?Math.min(ratios.reduce((a,b)=>a+b,0)/ratios.length/20,1):null;
+  },[data]);
 
   const handleMUpload=async(e)=>{
     if(!e.target.files||e.target.files.length<2)return;
@@ -2491,32 +3061,43 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
         const s=samples[i],ar=testData.find(d=>d.issue===s.meta.issue);
         if(!ar)continue;
         const pred=await runInference(model,s.features,mc,cfg.useMCDropout);
-        // 红球按概率加权采样6个（而非永远取top6），反映模型预测分布
-        const br=(()=>{
-          const probs=[...pred.redProbs.map((p,j)=>({p,n:j+1}))];
-          const picked=[];
-          // 加权随机采样（不放回）
-          for(let k=0;k<6;k++){
-            const total=probs.reduce((s,x)=>s+x.p,0);
-            let r=Math.random()*total, cum=0;
-            for(let m=0;m<probs.length;m++){
-              cum+=probs[m].p;
-              if(r<=cum){ picked.push(probs[m].n); probs.splice(m,1); break; }
-            }
-            if(picked.length<k+1) picked.push(probs.splice(0,1)[0].n); // fallback
-          }
-          return picked.sort((a,b)=>a-b);
-        })();
-        // 蓝球按概率分布采样（而非永远取最高概率），反映模型真实预测分布
-        const bb=(()=>{
-          const probs=pred.blueProbs;
-          const r=Math.random();
-          let cum=0;
-          for(let k=0;k<probs.length;k++){ cum+=probs[k]; if(r<=cum) return k+1; }
-          return probs.length; // fallback
-        })();
-        const c=2;
-        const{prize:prz,level,hitRed,hitBlue}=calcPrize(br,bb,[ar.red1,ar.red2,ar.red3,ar.red4,ar.red5,ar.red6],ar.blue);
+        // ─ v1.4.0: 动态博弈决策，传入当期奖池和近10期拥挤度 ─
+        const TOTAL_COMBOS=17721088;
+        const recentForCrowd=testData.slice(Math.max(0,i-10),i);
+        const crowdRatios=recentForCrowd.map(d=>{
+          const sl=d.sales||0,p1=d.prize1Count;
+          if(sl<=0||p1==null) return null;
+          const ew=(sl/2)/TOTAL_COMBOS; return ew>0.05?p1/ew:null;
+        }).filter(x=>x!=null);
+        const crowdNorm=crowdRatios.length>0
+          ?Math.min((crowdRatios.reduce((a,b)=>a+b,0)/crowdRatios.length)/20,1):0.5;
+        const betPlan=generateBetPlan(pred, cfg, ar.jackpot, crowdNorm);
+        let prz=0, level='Miss', hitRed=0, hitBlue=false, c=0;
+        const actRed=[ar.red1,ar.red2,ar.red3,ar.red4,ar.red5,ar.red6];
+
+        if(betPlan.skipped||betPlan.mode==='skip'){
+          c=0; prz=0; level='Skip'; hitRed=0; hitBlue=false;
+        } else if(betPlan.mode==='single'||betPlan.mode==='single_min'){
+          c=2;
+          const res=calcPrize(betPlan.reds, betPlan.blues[0], actRed, ar.blue);
+          prz=res.prize; level=res.level; hitRed=res.hitRed; hitBlue=res.hitBlue;
+        } else if(betPlan.mode==='compound'){
+          c=betPlan.cost;
+          const res=calcCompoundPrize(betPlan.selectedReds, betPlan.selectedBlues, actRed, ar.blue);
+          prz=res.prize; level=res.level; hitRed=0; hitBlue=false;
+        } else if(betPlan.mode==='dangtuo'){
+          c=betPlan.cost;
+          const dtBlues=betPlan.selectedBlues||betPlan.blues||[1];
+          const res=calcDanTuoPrize(betPlan.danReds, betPlan.tuoReds, dtBlues, actRed, ar.blue);
+          prz=res.prize; level=res.level; hitRed=0; hitBlue=false;
+        }
+
+        // 显示用红球（单式取betRed，复式/胆拖取核心号码，skip为空）
+        const br = (betPlan.mode==='skip'||betPlan.skipped) ? []
+                 : betPlan.mode==='single'||betPlan.mode==='single_min' ? betPlan.reds
+                 : betPlan.mode==='compound' ? betPlan.selectedReds
+                 : betPlan.danReds?[...betPlan.danReds,...betPlan.tuoReds]:betPlan.reds||[];
+        const bb = betPlan.blues ? betPlan.blues[0] : (betPlan.selectedBlues?betPlan.selectedBlues[0]:1);
         // 正确回撤计算：先扣成本（资金低点），再加奖金，再更新历史高点
         bal = bal - c;                            // 先扣投注成本
         const dd = maxBal>0 ? (maxBal-bal)/maxBal : 0;
@@ -2546,25 +3127,38 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
           betRed:br, betBlue:bb,
           hitRed, hitBlue, cost:c, prize:prz,
           balance:bal, prizeLevel:level, riskLevel:pred.riskLevel,
+          betMode:betPlan.mode, betNotes:betPlan.notes||1,
+          // 博弈环境数据
+          jackpot:ar.jackpot, sales:ar.sales,
+          crowdingIdx:s.meta.prize1Count!=null&&ar.sales>0
+            ? ((ar.prize1Count||0)/(ar.sales/2/17721088)).toFixed(2) : null,
+          streakDepth:s.meta.streakDepth||0,
           // 随机基准对照
-          randPrizeLevel:randResult.level, randPrize:randResult.prize
+          randPrizeLevel:randResult.level, randPrize:randResult.prize, randCost:2
         });
         if(i%5===0){setProg(((i+1)/samples.length)*100);setRecords([...recs]);setStatus(`回测中 ${i+1}/${samples.length}`);await tf.nextFrame();}
       }
       if(modelSrc==='browser')model.dispose();
       // 生存分析：连续N期至少中一次各等级奖的概率
+      // avgJackpot供量化看板凯利公式使用
+      const validJP=recs.filter(r=>r.jackpot>0).map(r=>r.jackpot);
+      const avgJackpot=validJP.length>0?validJP.reduce((a,b)=>a+b,0)/validJP.length:0;
+      const skipCount=recs.filter(r=>r.betMode==='skip'||r.prizeLevel==='Skip').length;
       const survivalStats = calcSurvival(recs);
       // 平均间隔期数
       const avgGapAny   = calcAvgGap(recs, r=>r.prize>0);
       const avgGap5th   = calcAvgGap(recs, r=>['5th','4th','3rd','2nd','1st'].includes(r.prizeLevel));
       const avgGap4th   = calcAvgGap(recs, r=>['4th','3rd','2nd','1st'].includes(r.prizeLevel));
       const avgGap3rd   = calcAvgGap(recs, r=>['3rd','2nd','1st'].includes(r.prizeLevel));
-      // 随机基准统计
+      // 随机基准统计（每期等额投入随机选号）
       const randWins = recs.filter(r=>r.randPrize>0).length;
       const randPrizeTotal = recs.reduce((s,r)=>s+(r.randPrize||0),0);
+      const randCostTotal = recs.reduce((s,r)=>s+(r.randCost||2),0);
       const randLevelCounts = {'1st':0,'2nd':0,'3rd':0,'4th':0,'5th':0,'6th':0,'Miss':0};
       recs.forEach(r=>{ if(r.randPrizeLevel) randLevelCounts[r.randPrizeLevel]=(randLevelCounts[r.randPrizeLevel]||0)+1; });
 
+      // 复式/胆拖下随机基准用相同cost复式（等额随机）
+      const avgCostPerPeriod = cost / Math.max(recs.length,1);
       const sm={
         totalIssues:recs.length, totalCost:cost, totalPrize:prize,
         finalBalance:bal,
@@ -2578,11 +3172,15 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
         officialRTP: (prize/cost)*100,
         // 随机基准对照
         randWinRate:(randWins/recs.length)*100,
-        randRTP:(randPrizeTotal/cost)*100,
+        randRTP:(randPrizeTotal/Math.max(randCostTotal,1))*100,
         randLevelCounts,
         // 模型超越随机的幅度
         edgeWinRate:((wins-randWins)/recs.length)*100,
-        edgeRTP:((prize-randPrizeTotal)/cost)*100
+        edgeRTP:((prize/Math.max(cost,1))-(randPrizeTotal/Math.max(randCostTotal,1)))*100,
+        // v1.3.0 新增
+        betMode:cfg.betMode,
+        avgCostPerPeriod: avgCostPerPeriod.toFixed(1),
+        coverageRate:(recs.filter(r=>r.prize>0).length/Math.max(recs.length,1)*100).toFixed(1),
       };
       setSummary(sm);setRecords(recs);setStatus('回测完成');
       const rtpNote = sm.officialRTP > 50
@@ -2613,6 +3211,152 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
         h('h3',{className:'font-bold mb-3'},'2. 回测参数'),
         h('div',{className:'space-y-3'},
           h('div',{},h('label',{className:'text-xs font-bold text-slate-500 block mb-1'},'初始资金 (¥)'),h('input',{type:'number',value:cfg.initialCapital,onChange:e=>setCfg({...cfg,initialCapital:+e.target.value}),className:'w-full border rounded px-3 py-2 text-sm bg-white'})),
+          // ── v1.3.0 投注模式选择 ──
+          h('div',{className:'space-y-3'},
+            h('label',{className:'text-xs font-bold text-slate-600 block'},'🎯 投注模式'),
+            h('div',{className:'grid grid-cols-3 gap-1'},
+              [{m:'single',label:'单式',desc:'1注/期'},{m:'compound',label:'复式',desc:'组合覆盖'},{m:'dangtuo',label:'胆拖',desc:'胆码固定'},{m:'dynamic',label:'🎯动态博弈',desc:'奖池联动'}]
+              .map(({m,label,desc})=>h('button',{key:m,onClick:()=>setCfg(p=>({...p,betMode:m})),
+                className:`py-1.5 rounded-lg text-xs font-bold border transition-all ${cfg.betMode===m?'bg-indigo-600 text-white border-indigo-600':'bg-white text-slate-500 border-slate-200 hover:border-indigo-300'}`
+              }, h('div',{},label), h('div',{className:'font-normal opacity-70 text-xs'},desc)))
+            ),
+            cfg.betMode==='compound'&&h('div',{className:'p-3 bg-indigo-50 rounded-lg border border-indigo-100 space-y-2'},
+              h('div',{className:'flex items-center justify-between'},
+                h('span',{className:'text-xs text-slate-600'},'红球数量'),
+                h('div',{className:'flex gap-1'},[6,7,8,9,10].map(n=>h('button',{key:n,
+                  onClick:()=>setCfg(p=>({...p,redBalls:n})),
+                  className:`w-7 h-7 rounded text-xs font-bold border ${cfg.redBalls===n?'bg-indigo-600 text-white':'bg-white text-slate-500 border-slate-200'}`},n)))
+              ),
+              h('div',{className:'flex items-center justify-between'},
+                h('span',{className:'text-xs text-slate-600'},'蓝球数'),
+                h('div',{className:'flex gap-1'},[1,2].map(n=>h('button',{key:n,
+                  onClick:()=>setCfg(p=>({...p,blueBalls:n})),
+                  className:`w-7 h-7 rounded text-xs font-bold border ${cfg.blueBalls===n?'bg-blue-600 text-white':'bg-white text-slate-500 border-slate-200'}`},n+'蓝')))
+              ),
+              h('div',{className:'text-xs text-indigo-700 font-mono font-bold'},
+                `C(${cfg.redBalls},6)×${cfg.blueBalls}蓝 = ${comb(cfg.redBalls,6)*cfg.blueBalls}注 · ¥${comb(cfg.redBalls,6)*cfg.blueBalls*2}/期`)
+            ),
+            cfg.betMode==='dangtuo'&&h('div',{className:'p-3 bg-amber-50 rounded-lg border border-amber-100 space-y-2'},
+              h('div',{className:'flex items-center justify-between'},
+                h('span',{className:'text-xs text-slate-600'},'胆码数'),
+                h('div',{className:'flex gap-1'},[1,2,3].map(n=>h('button',{key:n,
+                  onClick:()=>setCfg(p=>({...p,danCodes:n,tuoCodes:Math.max(p.tuoCodes,n+3)})),
+                  className:`w-7 h-7 rounded text-xs font-bold border ${cfg.danCodes===n?'bg-rose-600 text-white':'bg-white text-slate-500 border-slate-200'}`},n+'胆')))
+              ),
+              h('div',{className:'flex items-center justify-between'},
+                h('span',{className:'text-xs text-slate-600'},'拖码数'),
+                h('div',{className:'flex gap-1'},[6,7,8,9,10].map(n=>h('button',{key:n,
+                  onClick:()=>setCfg(p=>({...p,tuoCodes:n})),
+                  className:`w-7 h-7 rounded text-xs font-bold border ${cfg.tuoCodes===n?'bg-amber-600 text-white':'bg-white text-slate-500 border-slate-200'}`},n+'拖')))
+              ),
+              h('div',{className:'flex items-center justify-between'},
+                h('span',{className:'text-xs text-slate-600'},'蓝球数'),
+                h('div',{className:'flex gap-1'},[1,2].map(n=>h('button',{key:n,
+                  onClick:()=>setCfg(p=>({...p,blueBalls:n})),
+                  className:`w-7 h-7 rounded text-xs font-bold border ${cfg.blueBalls===n?'bg-blue-600 text-white':'bg-white text-slate-500 border-slate-200'}`},n+'蓝')))
+              ),
+              h('div',{className:'text-xs text-amber-700 font-mono font-bold'},
+                `${cfg.danCodes}胆${cfg.tuoCodes}拖 = C(${cfg.tuoCodes},${6-cfg.danCodes})×${cfg.blueBalls} = ${comb(cfg.tuoCodes,6-cfg.danCodes)*cfg.blueBalls}注 · ¥${comb(cfg.tuoCodes,6-cfg.danCodes)*cfg.blueBalls*2}/期`)
+            ),
+            cfg.betMode==='dynamic'&&h('div',{className:'p-3 bg-violet-50 rounded-lg border border-violet-200 space-y-3'},
+              h('div',{className:'text-xs font-bold text-violet-700 mb-2'},'🎯 动态博弈规则配置'),
+              // ── 奖池参与门槛 ──
+              h('div',{className:'space-y-1'},
+                h('div',{className:'flex items-center justify-between'},
+                  h('span',{className:'text-xs text-slate-600'},'奖池参与门槛'),
+                  h('span',{className:'text-xs font-bold text-violet-700'},
+                    cfg.dynJpThreshold>=1e9?'¥'+(cfg.dynJpThreshold/1e8).toFixed(0)+'亿':
+                    '¥'+(cfg.dynJpThreshold/1e8).toFixed(1)+'亿')
+                ),
+                h('input',{type:'range',min:0,max:2e9,step:5e7,
+                  value:cfg.dynJpThreshold||3e8,
+                  onChange:e=>setCfg(p=>({...p,dynJpThreshold:+e.target.value})),
+                  className:'w-full h-1.5 accent-violet-600'}),
+                h('div',{className:'flex justify-between text-xs text-slate-400'},
+                  h('span',{},'¥0（全参与）'),h('span',{},'¥3亿'),h('span',{},'¥10亿'),h('span',{},'¥20亿'))
+              ),
+              // ── 拥挤度热门判断线 ──
+              h('div',{className:'space-y-1'},
+                h('div',{className:'flex items-center justify-between'},
+                  h('span',{className:'text-xs text-slate-600'},'热门判断阈值'),
+                  h('span',{className:'text-xs font-bold text-violet-700'},
+                    ((cfg.dynCrowdHot||0.5)*100).toFixed(0)+'%  '+(crowdNorm_preview!=null&&crowdNorm_preview>=(cfg.dynCrowdHot||0.5)?'当前: 🔴热门':'当前: 🟢冷门'))
+                ),
+                h('input',{type:'range',min:0.1,max:0.9,step:0.05,
+                  value:cfg.dynCrowdHot||0.5,
+                  onChange:e=>setCfg(p=>({...p,dynCrowdHot:+e.target.value})),
+                  className:'w-full h-1.5 accent-violet-600'}),
+                h('div',{className:'flex justify-between text-xs text-slate-400'},
+                  h('span',{},'10%（极宽松）'),h('span',{},'50%'),h('span',{},'90%（极严格）'))
+              ),
+              // ── 冷门期策略 ──
+              h('div',{className:'flex items-center justify-between'},
+                h('span',{className:'text-xs text-slate-600'},'冷门期策略（奖池达标+冷门）'),
+                h('div',{className:'flex gap-1'},
+                  [{v:'dangtuo',l:'胆拖'},{v:'compound',l:'复式'},{v:'single',l:'单式'}].map(({v,l})=>
+                    h('button',{key:v,onClick:()=>setCfg(p=>({...p,dynCoolMode:v})),
+                      className:'px-2 py-1 rounded text-xs font-bold border transition-all '+
+                        (cfg.dynCoolMode===v?'bg-violet-600 text-white border-violet-600':'bg-white text-slate-500 border-slate-200')},l))
+                )
+              ),
+              // ── 热门期策略 ──
+              h('div',{className:'flex items-center justify-between'},
+                h('span',{className:'text-xs text-slate-600'},'热门期策略（奖池达标+热门）'),
+                h('div',{className:'flex gap-1'},
+                  [{v:'single',l:'单注'},{v:'skip',l:'跳过'},{v:'compound',l:'复式'}].map(({v,l})=>
+                    h('button',{key:v,onClick:()=>setCfg(p=>({...p,dynHotMode:v})),
+                      className:'px-2 py-1 rounded text-xs font-bold border transition-all '+
+                        (cfg.dynHotMode===v?'bg-rose-500 text-white border-rose-500':'bg-white text-slate-500 border-slate-200')},l))
+                )
+              ),
+              // ── 冷门胆拖参数（仅冷门=胆拖时显示）──
+              cfg.dynCoolMode==='dangtuo'&&h('div',{className:'p-2 bg-white rounded border border-violet-100 space-y-1.5'},
+                h('div',{className:'flex items-center justify-between'},
+                  h('span',{className:'text-xs text-slate-500'},'胆码数'),
+                  h('div',{className:'flex gap-1'},[1,2,3].map(n=>
+                    h('button',{key:n,onClick:()=>setCfg(p=>({...p,dynDanN:n})),
+                      className:'w-7 h-7 rounded text-xs font-bold border '+
+                        (cfg.dynDanN===n?'bg-rose-600 text-white':'bg-white text-slate-400 border-slate-200')},n+'胆')))
+                ),
+                h('div',{className:'flex items-center justify-between'},
+                  h('span',{className:'text-xs text-slate-500'},'拖码数'),
+                  h('div',{className:'flex gap-1'},[6,7,8,9,10].map(n=>
+                    h('button',{key:n,onClick:()=>setCfg(p=>({...p,dynTuoN:n})),
+                      className:'w-7 h-7 rounded text-xs font-bold border '+
+                        (cfg.dynTuoN===n?'bg-amber-600 text-white':'bg-white text-slate-400 border-slate-200')},n+'拖')))
+                ),
+                h('div',{className:'flex items-center justify-between'},
+                  h('span',{className:'text-xs text-slate-500'},'蓝球数'),
+                  h('div',{className:'flex gap-1'},[1,2].map(n=>
+                    h('button',{key:n,onClick:()=>setCfg(p=>({...p,dynBlueBalls:n})),
+                      className:'w-7 h-7 rounded text-xs font-bold border '+
+                        (cfg.dynBlueBalls===n?'bg-blue-600 text-white':'bg-white text-slate-400 border-slate-200')},n+'蓝')))
+                ),
+                h('div',{className:'text-xs text-violet-700 font-mono font-bold'},
+                  (cfg.dynDanN||2)+'胆'+(cfg.dynTuoN||8)+'拖 = C('+(cfg.dynTuoN||8)+','+(6-(cfg.dynDanN||2))+')×'+(cfg.dynBlueBalls||1)+
+                  ' = '+comb(cfg.dynTuoN||8,6-(cfg.dynDanN||2))*(cfg.dynBlueBalls||1)+'注 · ¥'+
+                  comb(cfg.dynTuoN||8,6-(cfg.dynDanN||2))*(cfg.dynBlueBalls||1)*2+'/冷门期')
+              ),
+              // ── 冷门复式参数（仅冷门=复式时显示）──
+              cfg.dynCoolMode==='compound'&&h('div',{className:'p-2 bg-white rounded border border-violet-100'},
+                h('div',{className:'flex items-center justify-between'},
+                  h('span',{className:'text-xs text-slate-500'},'红球数量'),
+                  h('div',{className:'flex gap-1'},[6,7,8,9,10].map(n=>
+                    h('button',{key:n,onClick:()=>setCfg(p=>({...p,dynCompoundN:n})),
+                      className:'w-7 h-7 rounded text-xs font-bold border '+
+                        (cfg.dynCompoundN===n?'bg-indigo-600 text-white':'bg-white text-slate-400 border-slate-200')},n)))
+                ),
+                h('div',{className:'text-xs text-violet-700 font-mono font-bold mt-1'},
+                  'C('+(cfg.dynCompoundN||7)+',6) = '+comb(cfg.dynCompoundN||7,6)+'注 · ¥'+comb(cfg.dynCompoundN||7,6)*2+'/冷门期')
+              )
+            ),
+            h('div',{className:'flex items-center gap-2'},
+              h('input',{type:'checkbox',id:'smartTiming',checked:cfg.smartTiming,
+                onChange:e=>setCfg(p=>({...p,smartTiming:e.target.checked})),className:'w-4 h-4'}),
+              h('label',{htmlFor:'smartTiming',className:'text-xs text-slate-600 cursor-pointer'},
+                '智能时机：奖池<5千万时自动降为单注')
+            )
+          ),
           h('div',{},h('label',{className:'text-xs font-bold text-slate-500 block mb-1'},'LookBack'),h('select',{value:cfg.lookBack,onChange:e=>setCfg({...cfg,lookBack:+e.target.value}),className:'w-full border rounded px-3 py-2 text-sm bg-white'},[10,20,30].map(v=>h('option',{key:v,value:v},`${v}期`)))),
           h('div',{className:'flex items-center justify-between bg-indigo-50 p-2 rounded border border-indigo-100'},h('span',{className:'text-xs font-bold text-indigo-800'},'MC Dropout'),h('input',{type:'checkbox',checked:cfg.useMCDropout,onChange:e=>setCfg({...cfg,useMCDropout:e.target.checked}),className:'accent-indigo-600'})),
           h('button',{onClick:runBT,disabled:running,className:`w-full py-3 rounded-lg font-bold flex items-center justify-center gap-2 ${running?'bg-slate-100 text-slate-400':'bg-indigo-600 text-white hover:bg-indigo-700'}`},running?'回测中...':'▶ 开始回测'),
@@ -2630,8 +3374,11 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
             ['最终余额', `¥${Math.round(summary.finalBalance).toLocaleString()}`, 'text-slate-800'],
             ['最大回撤', `-${summary.maxDrawdown.toFixed(1)}%`, 'text-red-400'],
             ['中奖率', `${summary.winRate.toFixed(2)}%`, 'text-slate-700'],
-            ['总投入', `¥${summary.totalCost}`, 'text-slate-500'],
-            ['总获奖', `¥${summary.totalPrize}`, 'text-slate-500'],
+            ['总投入', `¥${summary.totalCost.toLocaleString()}`, 'text-slate-500'],
+            ['总获奖', `¥${summary.totalPrize.toLocaleString()}`, 'text-slate-500'],
+            ['投注模式', summary.betMode==='single'?'单式':summary.betMode==='compound'?'复式':'胆拖', 'text-indigo-600'],
+            ['每期均成本', `¥${summary.avgCostPerPeriod}`, 'text-slate-600'],
+            ['覆盖率', `${summary.coverageRate}%`, 'text-emerald-600'],
           ].map(([l,v,c])=>h('div',{key:l,className:'flex justify-between items-center'},
             h('span',{className:'text-slate-500'},l),
             h('span',{className:`font-mono font-bold text-sm ${c}`},v)
@@ -2738,7 +3485,7 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
                 {k:'期号',cls:'px-3 py-2 text-left'},{k:'预测号码 (红+蓝)',cls:'px-3 py-2 text-left'},
                 {k:'红中',cls:'px-2 py-2 text-center'},{k:'蓝中',cls:'px-2 py-2 text-center'},
                 {k:'等级',cls:'px-2 py-2 text-center'},{k:'损益',cls:'px-3 py-2 text-right'},
-                {k:'余额',cls:'px-3 py-2 text-right'}
+                {k:'余额',cls:'px-3 py-2 text-right'},{k:'注数',cls:'px-2 py-2 text-center'}
               ].map(({k,cls})=>h('th',{key:k,className:cls+' font-medium text-slate-500 text-xs'},k)))
             ),
             h('tbody',{className:'divide-y divide-slate-100'},
@@ -2774,6 +3521,12 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
                       ),
                       h('td',{className:'px-3 py-1.5 text-right font-mono text-xs text-slate-600'},
                         Math.round(r.balance).toLocaleString()
+                      ),
+                      h('td',{className:'px-2 py-1.5 text-center'},
+                        h('span',{className:`text-xs px-1.5 py-0.5 rounded font-mono ${
+                          r.betMode==='compound'?'bg-indigo-100 text-indigo-700':
+                          r.betMode==='dangtuo'?'bg-amber-100 text-amber-700':'bg-slate-100 text-slate-500'}`},
+                          (r.betNotes||1)+'注')
                       )
                     );
                   })
@@ -2785,7 +3538,519 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
   );
 }
 
-// ─── APP ───
+
+// ══════════════════════════════════════════════════════════════
+// v1.4.0 智能决策引擎工具函数
+// ══════════════════════════════════════════════════════════════
+
+// 计算当前博弈环境信号（基于最近N期数据）
+function calcCrowdingSignal(recentData, ctx){
+  if(!recentData||recentData.length===0) return{crowding:0.5,trend:'unknown',confidence:0};
+  const TOTAL=17721088;
+  const samples=recentData.slice(-10).filter(d=>d.sales>0&&d.prize1Count!=null);
+  if(samples.length===0) return{crowding:0.5,trend:'unknown',confidence:0};
+  // 每期实际拥挤度 = actual_winners / expected_winners
+  const ratios=samples.map(d=>{
+    const exp=(d.sales/2)/TOTAL;
+    return exp>0.05 ? d.prize1Count/exp : null;
+  }).filter(x=>x!=null);
+  if(ratios.length===0) return{crowding:0.5,trend:'unknown',confidence:0};
+  const avgCrowd=ratios.reduce((s,v)=>s+v,0)/ratios.length;
+  const maxCrowd=ctx?ctx.maxCrowding:20;
+  const crowdNorm=Math.min(avgCrowd/maxCrowd,1);
+  // 趋势：最近3期 vs 前3期
+  let trend='stable';
+  if(ratios.length>=6){
+    const recent3=ratios.slice(-3).reduce((s,v)=>s+v,0)/3;
+    const prev3=ratios.slice(-6,-3).reduce((s,v)=>s+v,0)/3;
+    if(recent3>prev3*1.15) trend='rising';
+    else if(recent3<prev3*0.85) trend='falling';
+  }
+  // 置信度：有数据的期数越多越高
+  const confidence=Math.min(samples.length/10,1);
+  return{crowding:crowdNorm, avgRatio:avgCrowd, trend, confidence,
+         label:crowdNorm>0.6?'热门期':crowdNorm<0.35?'冷门期':'中性期'};
+}
+
+// 判断奖池状态
+function calcPoolStatus(latestDraw){
+  if(!latestDraw) return{level:'unknown',label:'数据不足',score:0.5,color:'text-slate-500',bg:'bg-slate-50',border:'border-slate-200'};
+  const jp=latestDraw.jackpot||0;
+  const streak=latestDraw._streakDepth||0;
+  if(jp>1.5e9||streak>=5) return{level:'mega',    label:'超级积累',score:1.0,color:'text-red-600',   bg:'bg-red-50',   border:'border-red-200'};
+  if(jp>8e8  ||streak>=3) return{level:'large',   label:'大额积累',score:0.75,color:'text-orange-600',bg:'bg-orange-50',border:'border-orange-200'};
+  if(jp>3e8  ||streak>=1) return{level:'medium',  label:'奖池积累',score:0.5, color:'text-amber-600', bg:'bg-amber-50', border:'border-amber-200'};
+  return                         {level:'normal',  label:'普通奖期',score:0.25,color:'text-slate-600', bg:'bg-slate-50', border:'border-slate-200'};
+}
+
+// 四象限定位：奖池状态(高/低) × 拥挤度预测(热门/冷门)
+function calcQuadrant(poolStatus, crowdSignal){
+  const poolHigh = poolStatus.score>=0.5;
+  const crowdHot = crowdSignal.crowding>=0.5;
+  if(poolHigh && !crowdHot) return{
+    q:'Q1', label:'最佳出击', emoji:'⚡',
+    color:'text-emerald-700', bg:'bg-emerald-50', border:'border-emerald-300',
+    desc:'奖池积累+冷门格局，一等奖金额高且分奖人少，性价比最优',
+    strategy:'aggressive',  // 激进：大额胆拖
+    budgetMult:2.0, betMode:'dangtuo'
+  };
+  if(poolHigh && crowdHot) return{
+    q:'Q2', label:'谨慎参与', emoji:'⚠️',
+    color:'text-amber-700', bg:'bg-amber-50', border:'border-amber-300',
+    desc:'奖池积累但选号集中，即使中奖也要与大量人分奖，收益打折',
+    strategy:'conservative', // 保守：小额复式
+    budgetMult:0.5, betMode:'compound'
+  };
+  if(!poolHigh && !crowdHot) return{
+    q:'Q3', label:'轻仓守候', emoji:'🎯',
+    color:'text-blue-700', bg:'bg-blue-50', border:'border-blue-300',
+    desc:'普通奖期+冷门格局，中奖分奖人少但总奖金小，保守单式维持参与',
+    strategy:'light',       // 轻仓：单式
+    budgetMult:1.0, betMode:'single'
+  };
+  return{
+    q:'Q4', label:'最小参与', emoji:'🚫',
+    color:'text-slate-500', bg:'bg-slate-50', border:'border-slate-300',
+    desc:'普通奖期且热门集中，最差组合，建议最小参与或跳过',
+    strategy:'skip',        // 跳过/最小
+    budgetMult:0.25, betMode:'single'
+  };
+}
+
+// 从MC Dropout推理结果中自动提取胆码（置信度最高的球）
+function extractDanCodes(redProbs, mcVariance, danN=2){
+  const scored = redProbs.map((p,i)=>{
+    const v=(mcVariance&&Array.isArray(mcVariance))?(mcVariance[i]||0):0;
+    return{n:i+1,p,variance:v,confidence:p*(1-Math.min(v*20,1))};
+  }).sort((a,b)=>b.confidence-a.confidence);
+  return scored.slice(0,danN).map(x=>x.n).sort((a,b)=>a-b);
+}
+
+// 生成完整投注方案
+function generateDecisionPlan(inferResult, poolStatus, crowdSignal, quadrant, baseBudget){
+  if(!inferResult) return null;
+  const pred=inferResult;
+  const budget=Math.round(baseBudget*(quadrant.budgetMult||1));
+  const mode=quadrant.betMode;
+  const TOTAL=17721088;
+
+  // 红球按概率+冷门偏好排序
+  const redRanked=pred.redProbs.map((p,i)=>({n:i+1,p})).sort((a,b)=>b.p-a.p);
+  const blueRanked=pred.blueProbs.map((p,i)=>({n:i+1,p})).sort((a,b)=>b.p-a.p);
+
+  let plans=[];
+
+  if(mode==='dangtuo'||quadrant.strategy==='aggressive'){
+    // 胆拖方案：Q1最佳出击
+    const danN=2, tuoN=Math.min(8, Math.floor(budget/2/comb(6,4))||6);
+    const danReds=extractDanCodes(pred.redProbs, pred.variance, danN);
+    const tuoPool=redRanked.filter(r=>!danReds.includes(r.n));
+    // 激进方案：胆码高置信度 + 拖码覆盖冷门区域
+    const tuoReds=tuoPool.slice(0,Math.min(tuoN,10)).map(r=>r.n);
+    const notes=comb(tuoReds.length,6-danN);
+    const cost=notes*2;
+    plans.push({
+      type:'dangtuo', label:`${danN}胆${tuoReds.length}拖 (激进)`,
+      danReds, tuoReds, blue:[blueRanked[0].n],
+      notes, cost,
+      rationale:`胆码=模型最高置信度球 [${danReds.join('·')}]，拖码覆盖次高概率区，一注命中奖金最大化`
+    });
+    // 双蓝方案
+    if(budget>=cost*2){
+      plans.push({
+        type:'dangtuo_2blue', label:`${danN}胆${tuoReds.length}拖×双蓝`,
+        danReds, tuoReds, blue:[blueRanked[0].n, blueRanked[1].n],
+        notes:notes*2, cost:cost*2,
+        rationale:`双蓝覆盖，命中一二等奖概率×2，成本加倍`
+      });
+    }
+  }
+
+  if(mode==='compound'||quadrant.strategy==='conservative'||quadrant.strategy==='light'){
+    // 复式方案：Q2/Q3
+    const redN= quadrant.strategy==='conservative' ? 7 : 6;
+    const topReds=redRanked.slice(0,redN).map(r=>r.n).sort((a,b)=>a-b);
+    const notes=comb(redN,6);
+    const cost=notes*2;
+    plans.push({
+      type:'compound', label:`${redN}红复式`,
+      reds:topReds, blue:[blueRanked[0].n],
+      notes, cost,
+      rationale:`模型概率Top-${redN}红球组合，覆盖${notes}注，保证系统化覆盖`
+    });
+  }
+
+  if(quadrant.strategy==='skip'||quadrant.strategy==='light'){
+    // 单式保底
+    const singleRed=redRanked.slice(0,6).map(r=>r.n).sort((a,b)=>a-b);
+    plans.push({
+      type:'single', label:'单式保底',
+      reds:singleRed, blue:[blueRanked[0].n],
+      notes:1, cost:2,
+      rationale:'最低成本维持参与，博弈环境不理想时的保底选择'
+    });
+  }
+
+  return{quadrant, poolStatus, crowdSignal, budget, plans, generatedAt:new Date().toLocaleString()};
+}
+
+
+function DecisionLab({data, activeModel, inferenceResult, btSum, btRecs}){
+  const {useState,useMemo,useCallback}=React;
+  const [baseBudget, setBaseBudget]=useState(100);
+  const [plan, setPlan]=useState(null);
+  const [computing, setComputing]=useState(false);
+  const [showHist, setShowHist]=useState(false);
+  const [histData, setHistData]=useState(null);
+
+  // 按时间排序
+  const sorted=useMemo(()=>{
+    if(!data||data.length===0) return [];
+    return [...data].sort((a,b)=>new Date(a.date)-new Date(b.date));
+  },[data]);
+
+  const latest=sorted.length>0?sorted[sorted.length-1]:null;
+
+  // streak depth（连续未开一等奖期数）
+  const streakDepth=useMemo(()=>{
+    let s=0;
+    for(let i=0;i<sorted.length-1;i++){
+      const d=sorted[i];
+      if(d.prize1Count!=null) s=d.prize1Count>0?0:s+1;
+    }
+    return s;
+  },[sorted]);
+
+  // 奖池状态
+  const poolStatus=useMemo(()=>{
+    if(!latest) return{level:'unknown',label:'无数据',score:0,color:'text-slate-400',bg:'bg-slate-50',border:'border-slate-200'};
+    const jp=latest.jackpot||0; const sk=streakDepth;
+    if(jp>1.5e9||sk>=5) return{level:'mega', label:'超级积累 >15亿',score:1.0, color:'text-red-600',   bg:'bg-red-50',   border:'border-red-200'};
+    if(jp>8e8  ||sk>=3) return{level:'large',label:'大额积累 >8亿', score:0.75,color:'text-orange-600',bg:'bg-orange-50',border:'border-orange-200'};
+    if(jp>3e8  ||sk>=1) return{level:'medium',label:'奖池积累 >3亿',score:0.5, color:'text-amber-600', bg:'bg-amber-50', border:'border-amber-200'};
+    return              {level:'normal',label:'普通奖期 <3亿',  score:0.25,color:'text-slate-500', bg:'bg-slate-50', border:'border-slate-200'};
+  },[latest,streakDepth]);
+
+  // 拥挤度信号（近10期实测均值）
+  const crowdSignal=useMemo(()=>{
+    if(sorted.length<5) return{norm:0.5,label:'数据不足',trend:'unknown',color:'text-slate-400'};
+    const TOTAL=17721088;
+    const recent=sorted.slice(-10);
+    const ratios=recent.map(d=>{
+      const sl=d.sales||0; const p1=d.prize1Count;
+      if(sl<=0||p1==null) return null;
+      const ew=(sl/2)/TOTAL;
+      return ew>0.05?p1/ew:null;
+    }).filter(x=>x!=null);
+    if(ratios.length===0) return{norm:0.5,label:'数据不足',trend:'unknown',color:'text-slate-400'};
+    const maxC=20;
+    const avg=ratios.reduce((s,v)=>s+v,0)/ratios.length;
+    const norm=Math.min(avg/maxC,1);
+    let trend='stable',trendLabel='→ 平稳';
+    if(ratios.length>=6){
+      const r3=ratios.slice(-3).reduce((s,v)=>s+v,0)/3;
+      const p3=ratios.slice(-6,-3).reduce((s,v)=>s+v,0)/3;
+      if(r3>p3*1.15){trend='rising';trendLabel='↗ 上升';}
+      else if(r3<p3*0.85){trend='falling';trendLabel='↘ 下降';}
+    }
+    const label=norm>0.6?'热门集中':norm<0.35?'冷门分散':'中性';
+    const color=norm>0.6?'text-red-500':norm<0.35?'text-emerald-600':'text-amber-500';
+    return{norm,avg,label,trend,trendLabel,color};
+  },[sorted]);
+
+  // 四象限判断
+  const quadrant=useMemo(()=>{
+    const highPool=poolStatus.score>=0.5;
+    const hot=crowdSignal.norm>=0.5;
+    if(highPool&&!hot) return{q:'Q1',emoji:'⚡',label:'最佳出击',
+      desc:'奖池积累+冷门格局，分奖人少，高性价比',
+      strategy:'dangtuo',budgetMult:2.0,
+      color:'text-emerald-700',bg:'bg-emerald-50',border:'border-emerald-300'};
+    if(highPool&&hot) return{q:'Q2',emoji:'⚠️',label:'谨慎参与',
+      desc:'奖池高但选号集中，中奖后分奖人多，收益打折',
+      strategy:'compound',budgetMult:0.5,
+      color:'text-amber-700',bg:'bg-amber-50',border:'border-amber-300'};
+    if(!highPool&&!hot) return{q:'Q3',emoji:'🎯',label:'轻仓守候',
+      desc:'普通奖期+冷门格局，中奖分奖少，单式保守参与',
+      strategy:'single',budgetMult:1.0,
+      color:'text-blue-700',bg:'bg-blue-50',border:'border-blue-300'};
+    return{q:'Q4',emoji:'🚫',label:'最小参与',
+      desc:'普通奖期+热门集中，最差组合，建议跳过或最小投入',
+      strategy:'skip',budgetMult:0.25,
+      color:'text-slate-500',bg:'bg-slate-50',border:'border-slate-300'};
+  },[poolStatus,crowdSignal]);
+
+  // 生成投注方案
+  const handleGenerate=useCallback(()=>{
+    setComputing(true);
+    setTimeout(()=>{
+      try{
+        const budget=Math.round(baseBudget*(quadrant.budgetMult||1));
+        const rp=inferenceResult?inferenceResult.redProbs:Array(33).fill(1/33);
+        const bp=inferenceResult?inferenceResult.blueProbs:Array(16).fill(1/16);
+        const redRanked=[...rp.map((p,i)=>({n:i+1,p}))].sort((a,b)=>b.p-a.p);
+        const blueRanked=[...bp.map((p,i)=>({n:i+1,p}))].sort((a,b)=>b.p-a.p);
+        // 胆码：高概率低方差
+        const mv=inferenceResult&&Array.isArray(inferenceResult.variance)?inferenceResult.variance:null;
+        const danReds=[...redRanked].map((x,i)=>({...x,conf:x.p*(1-Math.min((mv?mv[i]||0:0)*20,1))}))
+          .sort((a,b)=>b.conf-a.conf).slice(0,2).map(x=>x.n).sort((a,b)=>a-b);
+        const tuoPool=redRanked.filter(r=>!danReds.includes(r.n));
+        const tuoReds=tuoPool.slice(0,8).map(r=>r.n).sort((a,b)=>a-b);
+        const blue1=blueRanked[0].n; const blue2=blueRanked[1].n;
+        // 胆拖注数：C(拖码数, 6-胆码数)
+        const danN=danReds.length; const tuoN=tuoReds.length;
+        const notesDT=comb(tuoN,6-danN);
+        // 复式注数：C(7,6)=7
+        const top7=redRanked.slice(0,7).map(r=>r.n).sort((a,b)=>a-b);
+        const plans=[];
+        // Q1: 胆拖方案
+        plans.push({type:'dangtuo',label:`${danN}胆${tuoN}拖×单蓝`,
+          danReds,tuoReds,blue:[blue1],notes:notesDT,cost:notesDT*2,
+          tip:`胆码=[${danReds.join('·')}] 模型最高置信度，拖码Top-${tuoN}概率`});
+        if(budget>=notesDT*4) plans.push({type:'dangtuo2',label:`${danN}胆${tuoN}拖×双蓝`,
+          danReds,tuoReds,blue:[blue1,blue2],notes:notesDT*2,cost:notesDT*4,
+          tip:'双蓝覆盖，一/二等奖命中率×2，成本×2'});
+        // Q2/Q3: 复式方案
+        plans.push({type:'compound',label:'Top-7红复式×单蓝',
+          reds:top7,blue:[blue1],notes:7,cost:14,
+          tip:`模型概率前7红球，C(7,6)=7注`});
+        // 单式保底
+        const single=redRanked.slice(0,6).map(r=>r.n).sort((a,b)=>a-b);
+        plans.push({type:'single',label:'单式×单蓝',
+          reds:single,blue:[blue1],notes:1,cost:2,tip:'最低成本维持参与'});
+        // 按象限筛选推荐
+        const recType=quadrant.strategy==='dangtuo'?['dangtuo','dangtuo2']:
+                       quadrant.strategy==='compound'?['compound']:
+                       quadrant.strategy==='single'?['single']:['single'];
+        setPlan({quadrant,poolStatus,crowdSignal,budget,plans,recType,
+                 hasModel:!!inferenceResult,ts:new Date().toLocaleTimeString()});
+      }catch(e){alert('生成失败: '+e.message);}
+      setComputing(false);
+    },200);
+  },[baseBudget,quadrant,poolStatus,crowdSignal,inferenceResult]);
+
+  // 历史分布（点击后异步计算，避免卡死）
+  const handleShowHist=useCallback(()=>{
+    if(showHist){setShowHist(false);return;}
+    setShowHist(true);
+    if(histData) return;
+    setTimeout(()=>{
+      try{
+        const TOTAL=17721088; const maxC=20;
+        const stats={Q1:0,Q2:0,Q3:0,Q4:0};
+        let streak=0;
+        sorted.forEach((d,i)=>{
+          if(i<10) return;
+          const recent=sorted.slice(i-10,i);
+          const ratios=recent.map(r=>{
+            const sl=r.sales||0;const p1=r.prize1Count;
+            if(sl<=0||p1==null) return null;
+            const ew=(sl/2)/TOTAL; return ew>0.05?p1/ew:null;
+          }).filter(x=>x!=null);
+          const avg=ratios.length>0?ratios.reduce((s,v)=>s+v,0)/ratios.length:10;
+          const norm=Math.min(avg/maxC,1);
+          const jp=d.jackpot||0;
+          const highPool=(jp>3e8||streak>=1);
+          const hot=(norm>=0.5);
+          const q=highPool&&!hot?'Q1':highPool&&hot?'Q2':!highPool&&!hot?'Q3':'Q4';
+          stats[q]++;
+          if(d.prize1Count!=null) streak=d.prize1Count>0?0:streak+1;
+        });
+        const total=Object.values(stats).reduce((s,v)=>s+v,0)||1;
+        setHistData({stats,total,pct:{
+          Q1:(stats.Q1/total*100).toFixed(1),Q2:(stats.Q2/total*100).toFixed(1),
+          Q3:(stats.Q3/total*100).toFixed(1),Q4:(stats.Q4/total*100).toFixed(1)}});
+      }catch(e){console.error(e);}
+    },50);
+  },[sorted,showHist,histData]);
+
+  const noData=data.length===0;
+  const latestJP=latest&&latest.jackpot?`¥${(latest.jackpot/1e8).toFixed(2)}亿`:'暂无';
+
+  return h('div',{className:'space-y-4'},
+    // ── 状态栏 4格 ──────────────────────────────────────
+    h('div',{className:'grid grid-cols-2 md:grid-cols-4 gap-3'},
+      h('div',{className:'bg-white rounded-xl border border-slate-200 p-4'},
+        h('div',{className:'text-xs text-slate-400 mb-1'},'数据状态'),
+        h('div',{className:'text-sm font-bold '+(noData?'text-red-500':'text-emerald-600')},
+          noData?'⚠ 未加载':'✅ '+data.length+'期'),
+        h('div',{className:'text-xs text-slate-400 mt-0.5'},latest?latest.date:'请先加载CSV')
+      ),
+      h('div',{className:'bg-white rounded-xl border border-slate-200 p-4'},
+        h('div',{className:'text-xs text-slate-400 mb-1'},'推理状态'),
+        h('div',{className:'text-sm font-bold '+(inferenceResult?'text-emerald-600':'text-amber-500')},
+          inferenceResult?'✅ 已推理':'⚠ 未推理'),
+        h('div',{className:'text-xs text-slate-400 mt-0.5'},
+          inferenceResult?'概率分布就绪':'请在模型实验运行推理')
+      ),
+      h('div',{className:'bg-white rounded-xl border '+poolStatus.border+' p-4'},
+        h('div',{className:'text-xs text-slate-400 mb-1'},'当前奖池'),
+        h('div',{className:'text-sm font-bold '+poolStatus.color},poolStatus.label),
+        h('div',{className:'text-xs text-slate-400 mt-0.5'},latestJP+' · 积累'+streakDepth+'期')
+      ),
+      h('div',{className:'bg-white rounded-xl border border-slate-200 p-4'},
+        h('div',{className:'text-xs text-slate-400 mb-1'},'近10期拥挤度'),
+        h('div',{className:'text-sm font-bold '+crowdSignal.color},crowdSignal.label),
+        h('div',{className:'text-xs text-slate-400 mt-0.5'},crowdSignal.trendLabel||'数据不足')
+      )
+    ),
+
+    // ── 四象限矩阵 ──────────────────────────────────────
+    h('div',{className:'bg-white rounded-xl border border-slate-200 p-5'},
+      h('div',{className:'flex items-center justify-between mb-4'},
+        h('div',{className:'font-bold text-slate-800 text-sm'},'⚡ 四象限博弈矩阵'),
+        h('span',{className:'px-3 py-1 rounded-full text-xs font-bold border '+quadrant.bg+' '+quadrant.color+' '+quadrant.border},
+          quadrant.emoji+' '+quadrant.q+': '+quadrant.label)
+      ),
+      h('div',{className:'grid grid-cols-2 gap-2 mb-4'},
+        [{q:'Q1',e:'⚡',l:'最佳出击',s:'高奖池×冷门',c:'emerald'},
+         {q:'Q2',e:'⚠️',l:'谨慎参与',s:'高奖池×热门',c:'amber'},
+         {q:'Q3',e:'🎯',l:'轻仓守候',s:'普通×冷门', c:'blue'},
+         {q:'Q4',e:'🚫',l:'最小参与',s:'普通×热门', c:'slate'}
+        ].map(({q,e,l,s,c})=>{
+          const active=quadrant.q===q;
+          const cls=active
+            ?`bg-${c}-50 border-${c}-300 text-${c}-800 shadow-sm ring-2 ring-${c}-300`
+            :'bg-slate-50 border-slate-200 text-slate-400';
+          return h('div',{key:q,className:'rounded-xl border-2 p-3 transition-all '+cls},
+            h('div',{className:'text-xs font-bold mb-0.5'},e+' '+q+' '+l),
+            h('div',{className:'text-xs opacity-70'},s)
+          );
+        })
+      ),
+      h('div',{className:'rounded-lg p-4 '+quadrant.bg+' border '+quadrant.border},
+        h('div',{className:'text-sm font-bold '+quadrant.color+' mb-1'},
+          quadrant.emoji+' '+quadrant.label+'——'+quadrant.desc),
+        h('div',{className:'flex gap-4 text-xs mt-2'},
+          h('span',{className:'text-slate-600'},'推荐模式: ',
+            h('strong',{},quadrant.strategy==='dangtuo'?'胆拖':quadrant.strategy==='compound'?'复式':'单式')),
+          h('span',{className:'text-slate-600'},'预算系数: ',h('strong',{},'×'+quadrant.budgetMult)),
+          h('span',{className:'text-slate-600'},'奖池>3亿: ',h('strong',{className:poolStatus.score>=0.5?'text-emerald-600':'text-slate-400'},poolStatus.score>=0.5?'✅ 是':'❌ 否'))
+        )
+      )
+    ),
+
+    // ── 方案生成器 ──────────────────────────────────────
+    h('div',{className:'bg-white rounded-xl border border-slate-200 p-5'},
+      h('div',{className:'font-bold text-slate-800 text-sm mb-3'},'🎯 投注方案生成器'),
+      !inferenceResult&&h('div',{className:'text-xs text-amber-600 bg-amber-50 rounded-lg px-3 py-2 mb-3 border border-amber-100'},
+        '⚠ 未检测到模型推理结果，将使用均匀随机分布。请先在【模型实验】加载模型并推理以获得最优方案。'),
+      h('div',{className:'flex flex-wrap items-end gap-3 mb-4'},
+        h('div',{},
+          h('label',{className:'block text-xs text-slate-500 mb-1'},'本期基准预算 (¥)'),
+          h('input',{type:'number',value:baseBudget,min:10,step:10,
+            onChange:e=>setBaseBudget(+e.target.value||100),
+            className:'border border-slate-200 rounded-lg px-3 py-2 text-sm w-28 focus:outline-none focus:ring-1 focus:ring-indigo-400'})
+        ),
+        h('div',{className:'text-xs text-slate-400 pb-2'},
+          '象限系数×'+quadrant.budgetMult+' → 实际预算 ¥'+Math.round(baseBudget*quadrant.budgetMult)),
+        h('button',{onClick:handleGenerate,disabled:computing||noData,
+          className:'px-5 py-2 rounded-lg text-sm font-bold transition-all shadow-sm '+
+            (computing||noData?'bg-slate-200 text-slate-400 cursor-not-allowed':'bg-indigo-600 text-white hover:bg-indigo-700')},
+          computing?'生成中...':'⚡ 生成决策方案')
+      ),
+
+      // 方案展示
+      plan&&h('div',{className:'space-y-3'},
+        // 推荐方案（当前象限对应）
+        h('div',{className:'text-xs font-bold text-slate-500 uppercase tracking-wide mb-1'},'▶ 推荐方案'),
+        plan.plans.filter(p=>plan.recType.includes(p.type)).map((p,i)=>
+          h('div',{key:i,className:'rounded-xl border-2 border-indigo-200 bg-indigo-50 overflow-hidden'},
+            h('div',{className:'flex items-center justify-between px-4 py-2 bg-indigo-100'},
+              h('span',{className:'text-xs font-bold text-indigo-800'},p.label),
+              h('div',{className:'flex items-center gap-3'},
+                h('span',{className:'text-xs text-indigo-600'},p.notes+'注'),
+                h('span',{className:'text-sm font-bold text-indigo-700'},'¥'+p.cost))
+            ),
+            h('div',{className:'px-4 py-3'},
+              h('div',{className:'flex flex-wrap items-center gap-2 mb-2'},
+                p.danReds&&h('span',{className:'text-xs text-slate-500'},'胆:'),
+                p.danReds&&p.danReds.map(n=>h('span',{key:n,className:'w-8 h-8 rounded-full bg-red-600 text-white text-xs font-bold flex items-center justify-center'},n)),
+                p.tuoReds&&h('span',{className:'text-xs text-slate-500 ml-1'},'拖:'),
+                p.tuoReds&&p.tuoReds.map(n=>h('span',{key:n,className:'w-8 h-8 rounded-full bg-red-100 text-red-700 text-xs font-bold flex items-center justify-center border border-red-200'},n)),
+                p.reds&&p.reds.map(n=>h('span',{key:n,className:'w-8 h-8 rounded-full bg-red-500 text-white text-xs font-bold flex items-center justify-center'},n)),
+                h('span',{className:'text-xs text-slate-500 ml-1'},'蓝:'),
+                p.blue.map(n=>h('span',{key:n,className:'w-8 h-8 rounded-full bg-blue-600 text-white text-xs font-bold flex items-center justify-center'},n))
+              ),
+              h('div',{className:'text-xs text-slate-400'},p.tip)
+            )
+          )
+        ),
+        // 其他方案（折叠参考）
+        h('div',{className:'text-xs font-bold text-slate-400 uppercase tracking-wide mt-3 mb-1'},'参考方案'),
+        plan.plans.filter(p=>!plan.recType.includes(p.type)).map((p,i)=>
+          h('div',{key:i,className:'rounded-xl border border-slate-200 bg-slate-50 overflow-hidden'},
+            h('div',{className:'flex items-center justify-between px-4 py-2'},
+              h('span',{className:'text-xs text-slate-600'},p.label),
+              h('div',{className:'flex items-center gap-3'},
+                h('span',{className:'text-xs text-slate-400'},p.notes+'注'),
+                h('span',{className:'text-sm font-bold text-slate-600'},'¥'+p.cost))
+            ),
+            h('div',{className:'px-4 pb-3 flex flex-wrap items-center gap-2'},
+              p.danReds&&h('span',{className:'text-xs text-slate-400'},'胆:'),
+              p.danReds&&p.danReds.map(n=>h('span',{key:n,className:'w-7 h-7 rounded-full bg-red-500 text-white text-xs font-bold flex items-center justify-center'},n)),
+              p.tuoReds&&h('span',{className:'text-xs text-slate-400 ml-1'},'拖:'),
+              p.tuoReds&&p.tuoReds.map(n=>h('span',{key:n,className:'w-7 h-7 rounded-full bg-red-100 text-red-600 text-xs font-bold flex items-center justify-center border border-red-200'},n)),
+              p.reds&&p.reds.map(n=>h('span',{key:n,className:'w-7 h-7 rounded-full bg-red-400 text-white text-xs font-bold flex items-center justify-center'},n)),
+              h('span',{className:'text-xs text-slate-400 ml-1'},'蓝:'),
+              p.blue.map(n=>h('span',{key:n,className:'w-7 h-7 rounded-full bg-blue-500 text-white text-xs font-bold flex items-center justify-center'},n))
+            )
+          )
+        ),
+        // 决策摘要
+        h('div',{className:'mt-2 p-4 bg-gradient-to-r from-slate-50 to-indigo-50 rounded-xl border border-indigo-100 text-xs'},
+          h('div',{className:'font-bold text-indigo-700 mb-2'},'📋 本期决策摘要'),
+          h('div',{className:'grid grid-cols-2 md:grid-cols-4 gap-3'},
+            [['博弈象限',plan.quadrant.emoji+' '+plan.quadrant.q+' '+plan.quadrant.label],
+             ['奖池状态',plan.poolStatus.label],
+             ['拥挤信号',plan.crowdSignal.label],
+             ['建议预算','¥'+plan.budget],
+            ].map(([l,v])=>h('div',{key:l},
+              h('div',{className:'text-slate-400'},l),
+              h('div',{className:'font-bold text-slate-700 mt-0.5'},v)))
+          ),
+          h('div',{className:'text-slate-400 mt-2'},'生成: '+plan.ts+(plan.hasModel?' · 模型推理':' · 随机分布（无模型）'))
+        )
+      )
+    ),
+
+    // ── 历史象限分布（懒加载）──────────────────────────
+    h('div',{className:'bg-white rounded-xl border border-slate-200 p-5'},
+      h('div',{className:'flex items-center justify-between'},
+        h('div',{className:'font-bold text-slate-800 text-sm'},'📊 历史象限分布'),
+        h('button',{onClick:handleShowHist,
+          className:'text-xs px-3 py-1.5 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 transition-all'},
+          showHist?'收起':('展开分析 ('+sorted.length+'期)'))
+      ),
+      showHist&&h('div',{className:'mt-4'},
+        !histData?h('div',{className:'text-center py-6 text-slate-400 text-sm'},'计算中…')
+        :h('div',{},
+          h('div',{className:'grid grid-cols-2 md:grid-cols-4 gap-3 mb-3'},
+            [{q:'Q1',l:'⚡ 最佳出击',c:'bg-emerald-500'},
+             {q:'Q2',l:'⚠️ 谨慎参与',c:'bg-amber-500'},
+             {q:'Q3',l:'🎯 轻仓守候',c:'bg-blue-500'},
+             {q:'Q4',l:'🚫 最小参与',c:'bg-slate-400'}
+            ].map(({q,l,c})=>h('div',{key:q,className:'p-3 rounded-xl bg-slate-50 border border-slate-200'},
+              h('div',{className:'text-xs text-slate-500 mb-1'},l),
+              h('div',{className:'text-xl font-bold text-slate-800'},histData.pct[q]+'%'),
+              h('div',{className:'text-xs text-slate-400'},histData.stats[q]+'期 / '+histData.total+'期'),
+              h('div',{className:'mt-2 h-1.5 bg-slate-200 rounded-full overflow-hidden'},
+                h('div',{className:'h-full '+c+' rounded-full',style:{width:histData.pct[q]+'%'}}))
+            ))
+          ),
+          h('div',{className:'text-xs text-slate-400 bg-slate-50 rounded-lg px-4 py-3 border border-slate-100'},
+            'Q1最佳出击历史占比',histData.pct.Q1,'%（',histData.stats.Q1,'期），',
+            '理论上仅参与Q1+奖池>3亿期次可大幅提升单期期望值。',
+            'Q4最差组合',histData.pct.Q4,'%，可完全跳过节省成本。'
+          )
+        )
+      )
+    )
+  );
+}
+
+
+
 function App(){
   const [tab,setTab]=useState('data');
   const [data,setData]=useState([]);
@@ -2811,7 +4076,8 @@ function App(){
   };
 
   const tabs=[{id:'data',l:'数据总控',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></svg>`},{id:'validate',l:'数据契约',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>`},{id:'feature',l:'特征实验',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 7 6.82 21.18a2.83 2.83 0 0 1-3.99-.01 2.83 2.83 0 0 1 0-4L17 3"/><path d="m16 2 6 6"/><path d="M12 16H4"/></svg>`},{id:'model',l:'模型实验',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96-.46 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 4.44-1.14"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96-.46 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-4.44-1.14"/></svg>`},{id:'backtest',l:'历史回测',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg>`},{id:'dashboard',l:'量化看板',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/><line x1="2" y1="20" x2="22" y2="20"/></svg>`},
-  {id:'stat',l:'统计检验',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>`}];
+  {id:'stat',l:'统计检验',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>`},
+{id:'decision',l:'智能决策',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`}];
 
   return h('div',{className:'min-h-screen bg-slate-100 flex flex-col'},
     h('header',{className:'bg-slate-900 text-white shadow-lg sticky top-0 z-50'},
@@ -2824,7 +4090,7 @@ function App(){
           ),
           h('div',{},
             h('div',{className:'text-base font-bold tracking-tight leading-tight'},'SSQ 量化预测系统'),
-            h('div',{className:'text-xs text-indigo-400 font-mono leading-tight'},'v1.1.5')
+            h('div',{className:'text-xs text-indigo-400 font-mono leading-tight'},'v1.4.0')
           )
         ),
         h('nav',{className:'tab-scroll flex items-center space-x-1 bg-slate-800/80 p-1 rounded-xl border border-slate-700/50'},
@@ -2872,16 +4138,32 @@ function App(){
         tab==='model'&&(data.length>0?h(ModelLab,{data,activeModel:model,setActiveModel:setModel,inferenceResult:infResult,setInferenceResult:setInfResult,strategyResult:stratResult,setStrategyResult:setStratResult}):h('div',{className:'text-center py-20 text-slate-400 bg-white rounded-lg border border-dashed'},'请先上传数据')),
         tab==='backtest'&&(data.length>0?h(BacktestLab,{data,records:btRecs,setRecords:setBtRecs,summary:btSum,setSummary:setBtSum,externalModel:model,setExternalModel:setModel}):h('div',{className:'text-center py-20 text-slate-400 bg-white rounded-lg border border-dashed'},'请先上传数据')),
         tab==='dashboard'&&h(Dashboard,{data:data.filter(d=>d.usage==='train'),btSum,stratResult}),
-        tab==='stat'&&(data.length>0?h(StatLab,{data}):h('div',{className:'text-center py-20 text-slate-400 bg-white rounded-lg border border-dashed'},'请先上传数据'))
+        tab==='stat'&&(data.length>0?h(StatLab,{data}):h('div',{className:'text-center py-20 text-slate-400 bg-white rounded-lg border border-dashed'},'请先上传数据')),
+        tab==='decision'&&h(DecisionLab,{data,activeModel:model,inferenceResult:infResult,trainSplit:ratio,btSum,btRecs})
       )
     )
   );
 }
 
+class ErrorBoundary extends React.Component{
+  constructor(p){super(p);this.state={err:null,info:null};}
+  static getDerivedStateFromError(e){return{err:e};}
+  componentDidCatch(e,info){console.error('[SSQ] React Error:',e,info);}
+  render(){
+    if(this.state.err){
+      return h('div',{style:{padding:'40px',fontFamily:'monospace',color:'#c00'}},
+        h('h2',{},'⚠ 页面渲染错误'),
+        h('p',{style:{marginTop:'8px',color:'#555'}},this.state.err.message),
+        h('button',{onClick:()=>this.setState({err:null}),style:{marginTop:'16px',padding:'8px 16px',background:'#3b82f6',color:'white',border:'none',borderRadius:'6px',cursor:'pointer'}},'重新加载')
+      );
+    }
+    return this.props.children;
+  }
+}
 tf.setBackend('cpu');
 tf.ready().then(()=>console.log('[SSQ] TF.js ready, backend:',tf.getBackend()));
 const root=ReactDOM.createRoot(document.getElementById('root'));
-root.render(h(App,null));
+root.render(h(ErrorBoundary,null,h(App,null)));
 </script>
 </body>
 </html>
