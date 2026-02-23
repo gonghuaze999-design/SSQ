@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>SSQ 量化预测系统 v1.1.5</title>
+<title>SSQ 量化预测系统 v1.5.2-stable</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style id="tw-fallback">
 
@@ -1227,6 +1227,248 @@ function calcSurvival(recs){
   return result;
 }
 
+// ══════════════════════════════════════════════════════════════
+// v1.5.0 轻量 GBM / XGBoost 实现（纯JS，无外部依赖）
+// 针对双色球：每个红球号码独立训练一棵梯度提升树
+// 输入：单期 69 维特征向量（不需要时序窗口）
+// 输出：33个红球 + 16个蓝球的概率估计
+// ══════════════════════════════════════════════════════════════
+
+// ── 单棵回归树节点 ──
+function gbmBuildTree(X, grads, hessians, depth, maxDepth, minLeaf, lambda){
+  const n = X.length;
+  if(depth >= maxDepth || n < minLeaf * 2){
+    // 叶节点：输出 = -sum(grads) / (sum(hessians) + lambda)
+    const sg = grads.reduce((a,b)=>a+b,0);
+    const sh = hessians.reduce((a,b)=>a+b,0);
+    return { leaf: true, value: -sg / (sh + lambda) };
+  }
+  let bestGain = -Infinity, bestFeat = -1, bestThresh = 0;
+  const numFeatures = X[0].length;
+  // 随机子采样特征（subsample_features = sqrt(69) ≈ 8）
+  const featSubset = [];
+  const allFeats = [...Array(numFeatures)].map((_,i)=>i);
+  const subSize = Math.max(8, Math.floor(Math.sqrt(numFeatures)));
+  while(featSubset.length < subSize){
+    const idx = Math.floor(Math.random() * allFeats.length);
+    featSubset.push(allFeats.splice(idx,1)[0]);
+  }
+  const sg_total = grads.reduce((a,b)=>a+b,0);
+  const sh_total = hessians.reduce((a,b)=>a+b,0);
+  const scoreRoot = sg_total*sg_total / (sh_total + lambda);
+
+  for(const fi of featSubset){
+    // 取该特征的所有值，排序后取候选分裂点（最多10个分位数）
+    const vals = X.map(x=>x[fi]).sort((a,b)=>a-b);
+    const uniqueVals = [...new Set(vals)];
+    const step = Math.max(1, Math.floor(uniqueVals.length / 10));
+    const thresholds = uniqueVals.filter((_,i)=>i%step===0);
+    for(const thresh of thresholds){
+      const leftIdx = [], rightIdx = [];
+      X.forEach((_,i)=>{ X[i][fi] <= thresh ? leftIdx.push(i) : rightIdx.push(i); });
+      if(leftIdx.length < minLeaf || rightIdx.length < minLeaf) continue;
+      const sgL = leftIdx.reduce((s,i)=>s+grads[i],0);
+      const shL = leftIdx.reduce((s,i)=>s+hessians[i],0);
+      const sgR = rightIdx.reduce((s,i)=>s+grads[i],0);
+      const shR = rightIdx.reduce((s,i)=>s+hessians[i],0);
+      const gain = sgL*sgL/(shL+lambda) + sgR*sgR/(shR+lambda) - scoreRoot;
+      if(gain > bestGain){ bestGain=gain; bestFeat=fi; bestThresh=thresh; }
+    }
+  }
+  if(bestFeat < 0){
+    const sg = grads.reduce((a,b)=>a+b,0);
+    const sh = hessians.reduce((a,b)=>a+b,0);
+    return{ leaf:true, value: -sg/(sh+lambda) };
+  }
+  const leftIdx = [], rightIdx = [];
+  X.forEach((_,i)=>{ X[i][bestFeat] <= bestThresh ? leftIdx.push(i) : rightIdx.push(i); });
+  return{
+    leaf:false, feat:bestFeat, thresh:bestThresh,
+    left:  gbmBuildTree(leftIdx.map(i=>X[i]),  leftIdx.map(i=>grads[i]),  leftIdx.map(i=>hessians[i]),  depth+1, maxDepth, minLeaf, lambda),
+    right: gbmBuildTree(rightIdx.map(i=>X[i]), rightIdx.map(i=>grads[i]), rightIdx.map(i=>hessians[i]), depth+1, maxDepth, minLeaf, lambda)
+  };
+}
+
+function gbmPredictTree(tree, x){
+  if(tree.leaf) return tree.value;
+  return x[tree.feat] <= tree.thresh ? gbmPredictTree(tree.left, x) : gbmPredictTree(tree.right, x);
+}
+
+// ── sigmoid / logit 工具 ──
+function sigmoid(x){ return 1/(1+Math.exp(-Math.max(-20,Math.min(20,x)))); }
+
+// ── 训练单个目标的 GBM 模型（二元交叉熵损失）──
+// labels: 0/1 数组，X: 特征矩阵
+function gbmTrainOne(X, labels, cfg){
+  const { nTrees=50, lr=0.1, maxDepth=4, minLeaf=5, lambda=1.0, subsample=0.8 } = cfg;
+  const n = X.length;
+  // 初始预测：logit(mean(labels))
+  const meanY = labels.reduce((a,b)=>a+b,0)/n;
+  const initPred = Math.log((meanY+1e-6)/(1-meanY+1e-6));
+  const F = new Array(n).fill(initPred);
+  const trees = [];
+  for(let t=0; t<nTrees; t++){
+    // 样本子采样
+    const sampleIdx = [];
+    for(let i=0;i<n;i++){ if(Math.random()<subsample) sampleIdx.push(i); }
+    if(sampleIdx.length < minLeaf*2) continue;
+    const Xs = sampleIdx.map(i=>X[i]);
+    const grads = sampleIdx.map(i=>{ const p=sigmoid(F[i]); return p - labels[i]; });
+    const hess  = sampleIdx.map(i=>{ const p=sigmoid(F[i]); return Math.max(p*(1-p),1e-6); });
+    const tree = gbmBuildTree(Xs, grads, hess, 0, maxDepth, minLeaf, lambda);
+    // 更新全量预测（包含未采样部分也用相同树）
+    for(let i=0;i<n;i++) F[i] += lr * gbmPredictTree(tree, X[i]);
+    trees.push(tree);
+  }
+  return{ trees, initPred, lr };
+}
+
+function gbmPredictOne(model, x){
+  let f = model.initPred;
+  for(const tree of model.trees) f += model.lr * gbmPredictTree(tree, x);
+  return sigmoid(f);
+}
+
+// ── 准备 XGBoost 用的扁平特征（单期，无时序窗口）──
+// 复用 encodeFeatures，取最近1期特征作为样本
+function prepareXGBSamples(data, externalCtx){
+  // ── v1.5.0 fix: 特征用 prev（前一期已知数据），标签用 cur（当期待预测结果）
+  // 与LSTM prepareTensors逻辑一致：输入历史，预测未来
+  // 严禁将cur自身的红蓝球one-hot编入特征（[0-32][33-48]维是当期开奖结果，训练时应mask掉）
+  const sorted = [...data].sort((a,b)=>new Date(a.date)-new Date(b.date));
+  const ctx = externalCtx || buildDataContext(sorted);
+  let streak=0;
+  const augmented = sorted.map(d=>{
+    const s=streak;
+    if(d.prize1Count!=null){ streak = d.prize1Count>0 ? 0 : streak+1; }
+    return {...d, _streakDepth:s};
+  });
+  const samples = [];
+  for(let i=1; i<augmented.length; i++){
+    const cur = augmented[i];   // 当期：提供预测目标（标签）
+    const prev = augmented[i-1]; // 前期：提供特征（已知信息）
+    // 特征向量基于 prev，屏蔽掉prev本身的red/blue one-hot（[0-48]置0，避免模型依赖上期开奖号码规律）
+    // 保留 [49-68] 的统计/博弈/周期特征，这些是有预测价值的
+    const feat = encodeFeatures(prev, ctx, i>=2?augmented[i-2]:null);
+    // 把 one-hot 维度置 0（避免模型拟合上期号码的"热/冷"记忆而非真实规律）
+    for(let k=0;k<49;k++) feat[k]=0;
+    // 补充 prev→cur 的间隔/冷热特征（各号码距上次出现的期数，归一化）
+    const prevReds=new Set([prev.red1,prev.red2,prev.red3,prev.red4,prev.red5,prev.red6]);
+    for(let b=0;b<33;b++) feat[b] = prevReds.has(b+1) ? 1 : 0; // 上期开奖号（供学习热号规律）
+    if(prev.blue>=1&&prev.blue<=16) feat[33+prev.blue-1]=1; // 上期蓝球
+    // 标签：当期实际开奖
+    const redLabel = new Array(33).fill(0);
+    [cur.red1,cur.red2,cur.red3,cur.red4,cur.red5,cur.red6].forEach(r=>{ if(r>=1&&r<=33) redLabel[r-1]=1; });
+    const blueLabel = new Array(16).fill(0);
+    if(cur.blue>=1&&cur.blue<=16) blueLabel[cur.blue-1]=1;
+    samples.push({ feat, redLabel, blueLabel, meta:{ issue:cur.issue, date:cur.date } });
+  }
+  return{ samples, ctx };
+}
+
+// ── 训练完整 XGBoost 模型（33棵红球树 + 16棵蓝球树）──
+async function trainXGBoost(trainData, cfg={}, onProgress){
+  const gbmCfg = {
+    nTrees: cfg.nTrees || 40,
+    lr: cfg.lr || 0.1,
+    maxDepth: cfg.maxDepth || 4,
+    minLeaf: cfg.minLeaf || 5,
+    lambda: 1.0,
+    subsample: 0.8
+  };
+  const { samples, ctx } = prepareXGBSamples(trainData);
+  const X = samples.map(s=>s.feat);
+  const total = 33 + 16;
+  const redModels = [], blueModels = [];
+  // 训练33棵红球树
+  for(let b=0; b<33; b++){
+    const labels = samples.map(s=>s.redLabel[b]);
+    redModels.push(gbmTrainOne(X, labels, gbmCfg));
+    if(onProgress) onProgress(Math.round((b+1)/total*100));
+    // 让UI有机会更新
+    if(b%5===4) await new Promise(r=>setTimeout(r,0));
+  }
+  // 训练16棵蓝球树
+  for(let b=0; b<16; b++){
+    const labels = samples.map(s=>s.blueLabel[b]);
+    blueModels.push(gbmTrainOne(X, labels, gbmCfg));
+    if(onProgress) onProgress(Math.round((33+b+1)/total*100));
+    if(b%4===3) await new Promise(r=>setTimeout(r,0));
+  }
+  return{ redModels, blueModels, ctx, trainedAt: new Date().toISOString(), config: gbmCfg };
+}
+
+// ── XGBoost 推理单期（输入单个69维特征向量）──
+function xgbInferOne(xgbModel, feat){
+  const { redModels, blueModels } = xgbModel;
+  const rawRed = redModels.map(m=>gbmPredictOne(m, feat));
+  const rawBlue = blueModels.map(m=>gbmPredictOne(m, feat));
+  // softmax 归一化
+  const softmax = arr => {
+    const mx = Math.max(...arr);
+    const e = arr.map(v=>Math.exp(v-mx));
+    const s = e.reduce((a,b)=>a+b,0);
+    return e.map(v=>v/s);
+  };
+  const redProbs = softmax(rawRed);
+  const blueProbs = softmax(rawBlue);
+  // 取 Top-6 红球和 Top-1 蓝球
+  const redTopIdx = [...redProbs.map((p,i)=>({p,i}))].sort((a,b)=>b.p-a.p).slice(0,6).map(x=>x.i+1).sort((a,b)=>a-b);
+  const blueTopIdx = [...blueProbs.map((p,i)=>({p,i}))].sort((a,b)=>b.p-a.p)[0].i+1;
+  return{ redProbs, blueProbs, redTop6: redTopIdx, blueTop1: blueTopIdx,
+          uncertaintyRed:0, uncertaintyBlue:0, variance:null, riskLevel:'medium' };
+}
+
+// ── XGBoost 推理最新一期（用于智能决策）──
+// 用最新已知一期(cur)的特征预测下一期结果
+function xgbInferLatest(xgbModel, data){
+  const sorted = [...data].sort((a,b)=>new Date(a.date)-new Date(b.date));
+  const ctx = xgbModel.ctx;
+  let streak=0;
+  const aug = sorted.map(d=>{
+    const s=streak;
+    if(d.prize1Count!=null){ streak = d.prize1Count>0 ? 0 : streak+1; }
+    return {...d, _streakDepth:s};
+  });
+  // cur = 最新已知一期，prev = 前一期（用于计算统计特征）
+  const cur = aug[aug.length-1];
+  const prev = aug.length>=2 ? aug[aug.length-2] : null;
+  const feat = encodeFeatures(cur, ctx, prev);
+  // 与训练时保持一致：one-hot保留cur的红蓝球作为"上期开奖信息"
+  // [0-48] 已在 encodeFeatures 中编入 cur 的 one-hot，正确
+  return xgbInferOne(xgbModel, feat);
+}
+
+// ── 对回测测试集运行 XGBoost 推理（逐期）──
+// allData：完整数据集（含训练集），用于正确继承 streakDepth 和 prev
+function xgbInferSamples(xgbModel, testData, allData){
+  const ctx = xgbModel.ctx;
+  // 用全量数据排序，确保 streakDepth 从头累计（不从0重置），prev也能跨训练/测试边界
+  const allSorted = [...(allData||testData)].sort((a,b)=>new Date(a.date)-new Date(b.date));
+  let streak=0;
+  const allAug = allSorted.map(d=>{
+    const s=streak;
+    if(d.prize1Count!=null){ streak = d.prize1Count>0 ? 0 : streak+1; }
+    return {...d, _streakDepth:s};
+  });
+  // 只对 testData 期号做推理，但 prev 取全量数据中的前一期
+  const testIssueSet = new Set(testData.map(d=>d.issue));
+  const results = [];
+  for(let i=1; i<allAug.length; i++){
+    const cur = allAug[i];
+    if(!testIssueSet.has(cur.issue)) continue;
+    const prev = allAug[i-1];
+    // 特征向量同训练时：基于 prev，one-hot反映上期开奖，[49-68]反映统计博弈特征
+    const feat = encodeFeatures(prev, ctx, i>=2?allAug[i-2]:null);
+    for(let k=0;k<49;k++) feat[k]=0;
+    const prevReds=new Set([prev.red1,prev.red2,prev.red3,prev.red4,prev.red5,prev.red6]);
+    for(let b=0;b<33;b++) feat[b] = prevReds.has(b+1) ? 1 : 0;
+    if(prev.blue>=1&&prev.blue<=16) feat[33+prev.blue-1]=1;
+    results.push({ ...xgbInferOne(xgbModel, feat), issue: cur.issue, date: cur.date });
+  }
+  return results;
+}
+
 // ─── MODEL UTILS ───
 function smTemp(logits,t){
   t=Math.max(t,0.1);
@@ -2078,7 +2320,7 @@ function InvestPanel({data, btSum, stratResult}){
     rose:   {bg:'bg-rose-50',   border:'border-rose-200',   text:'text-rose-700',   badge:'bg-rose-100'},
   };
 
-  return h('div',{className:'bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden'},
+  return h('div',{className:'bg-white rounded-xl border border-slate-200 shadow-sm'},
     // 头部
     h('div',{className:'px-6 py-4 border-b border-slate-100 flex justify-between items-center'},
       h('div',{},
@@ -3014,12 +3256,30 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
     dynTuoN:8,               // 动态胆拖拖码数
     dynCompoundN:7,          // 动态复式红球数
     dynBlueBalls:1,          // 动态模式蓝球数
+    // ── v1.5.0 模型类型 ──
+    modelType:'lstm',        // 'lstm' | 'xgboost' | 'ensemble'
+    xgbNTrees:40,            // GBM轮数(每棵树)
+    xgbMaxDepth:4,           // 树最大深度
+    xgbLR:0.1,               // 学习率
   });
   const [modelSrc,setModelSrc]=useState('external');
   const [running,setRunning]=useState(false);
   const [prog,setProg]=useState(0);
   const [status,setStatus]=useState('');
   const [diagnosis,setDiagnosis]=useState(null);
+  // ── v1.5.0 XGBoost 状态 ──
+  const [xgbModel,setXgbModel]=useState(null);
+  const [xgbTraining,setXgbTraining]=useState(false);
+  const [xgbProg,setXgbProg]=useState(0);
+  const [xgbStatus,setXgbStatus]=useState('');
+  const [cmpResult,setCmpResult]=useState(null);
+  // ── v1.5.0 回测历史记录 ──
+  const [btHistory,setBtHistory]=useState(()=>{
+    try{ return JSON.parse(localStorage.getItem('ssq_bt_history')||'[]'); }catch(e){ return []; }
+  });
+  const [selectedIds,setSelectedIds]=useState(new Set());
+  const [deleteConfirm,setDeleteConfirm]=useState(null); // null | {ids, single}
+  const [storageWarn,setStorageWarn]=useState(false);
   const abortRef=useRef(false);
   const testData=useMemo(()=>data.filter(d=>d.usage==='test'),[data]);
   const crowdNorm_preview=useMemo(()=>{
@@ -3039,10 +3299,74 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
     try{const m=await loadModelFromFiles(e.target.files);setExternalModel(m);}catch(err){alert(err.message);}
   };
 
+  // ── 回测历史记录操作函数 ──
+  const refreshHistory=()=>{
+    try{
+      const saved=JSON.parse(localStorage.getItem('ssq_bt_history')||'[]');
+      setBtHistory(saved);
+      // 容量告警：JSON大小超过400KB（约80%的500KB估算上限）
+      const usage=JSON.stringify(saved).length;
+      setStorageWarn(usage>400000);
+    }catch(e){}
+  };
+  const toggleStar=(id)=>{
+    const saved=JSON.parse(localStorage.getItem('ssq_bt_history')||'[]');
+    const upd=saved.map(r=>r.id===id?{...r,starred:!r.starred}:r);
+    localStorage.setItem('ssq_bt_history',JSON.stringify(upd));
+    setBtHistory(upd);
+  };
+  const updateNote=(id,note)=>{
+    const saved=JSON.parse(localStorage.getItem('ssq_bt_history')||'[]');
+    const upd=saved.map(r=>r.id===id?{...r,note}:r);
+    localStorage.setItem('ssq_bt_history',JSON.stringify(upd));
+    setBtHistory(upd);
+  };
+  const confirmDelete=(ids, single=false)=>{
+    setDeleteConfirm({ids, single});
+  };
+  const executeDelete=(ids)=>{
+    const saved=JSON.parse(localStorage.getItem('ssq_bt_history')||'[]');
+    const idSet=new Set(ids);
+    const upd=saved.filter(r=>!idSet.has(r.id));
+    localStorage.setItem('ssq_bt_history',JSON.stringify(upd));
+    setBtHistory(upd);
+    setSelectedIds(prev=>{const n=new Set(prev);ids.forEach(id=>n.delete(id));return n;});
+    setDeleteConfirm(null);
+    const usage=JSON.stringify(upd).length;
+    setStorageWarn(usage>400000);
+  };
+  const toggleSelect=(id)=>{
+    setSelectedIds(prev=>{const n=new Set(prev);n.has(id)?n.delete(id):n.add(id);return n;});
+  };
+  const toggleSelectAll=()=>{
+    if(selectedIds.size===btHistory.length) setSelectedIds(new Set());
+    else setSelectedIds(new Set(btHistory.map(r=>r.id)));
+  };
+
+  // ── v1.5.0 训练 XGBoost ──
+  const handleTrainXGB=async()=>{
+    const trainData=data.filter(d=>d.usage==='train');
+    if(trainData.length<100){alert('训练数据不足（需至少100期），请先加载CSV数据');return;}
+    setXgbTraining(true);setXgbProg(0);setXgbStatus('初始化...');
+    try{
+      await new Promise(r=>setTimeout(r,10));
+      const xgbCfg={nTrees:cfg.xgbNTrees||40,maxDepth:cfg.xgbMaxDepth||4,lr:cfg.xgbLR||0.1};
+      setXgbStatus('训练中（33红+16蓝=49棵树）...');
+      const model=await trainXGBoost(trainData, xgbCfg, p=>{
+        setXgbProg(p);setXgbStatus('训练中... '+p+'%');
+      });
+      setXgbModel(model);
+      setXgbStatus('✓ 训练完成 ('+trainData.length+'期训练集)');
+    }catch(e){setXgbStatus('❌ 训练失败: '+e.message);}
+    finally{setXgbTraining(false);}
+  };
+
   const runBT=async()=>{
     if(!testData.length)return;
-    if(modelSrc==='external'&&!externalModel){alert('请先上传模型文件');return;}
-    setRunning(true);abortRef.current=false;setRecords([]);setSummary(null);setDiagnosis(null);setProg(0);setStatus('初始化...');
+    if((cfg.modelType==='xgboost'||cfg.modelType==='ensemble')&&!xgbModel){alert('请先训练XGBoost模型');return;}
+    if((cfg.modelType==='lstm'||cfg.modelType==='ensemble')&&modelSrc==='external'&&!externalModel){alert('请先上传LSTM模型文件');return;}
+    if(cfg.modelType==='lstm'&&modelSrc==='external'&&!externalModel){alert('请先上传模型文件');return;}
+    setRunning(true);abortRef.current=false;setRecords([]);setSummary(null);setDiagnosis(null);setCmpResult(null);setProg(0);setStatus('初始化...');
     try{
       let model=modelSrc==='external'&&externalModel?externalModel:buildModel({lookBack:cfg.lookBack,unitsLSTM:32,dropout:0.2,useLayerNorm:false,temperature:1.0});
       // ── 防数据泄露：用训练集建立归一化上下文，测试集用训练集的统计基准 ──
@@ -3052,15 +3376,43 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
       );
       const samples = prepareTensors(testData, cfg.lookBack, trainCtx);
       if(!samples.length)throw new Error('测试样本为空，检查LookBack设置');
+      // ── v1.5.0: XGBoost 逐期推理缓存（避免在循环内重复计算）──
+      let xgbPreds = null;
+      if(xgbModel && (cfg.modelType==='xgboost'||cfg.modelType==='ensemble')){
+        setStatus('XGBoost 推理测试集...');
+        xgbPreds = xgbInferSamples(xgbModel, testData, data); // 传入全量data确保streak连续、prev跨边界正确
+      }
       let bal=cfg.initialCapital,maxBal=bal,maxDD=0,cost=0,prize=0,wins=0,bigPrize=0;
       const levelCounts={'1st':0,'2nd':0,'3rd':0,'4th':0,'5th':0,'6th':0,'Miss':0};
+      // ── v1.5.0 XGBoost 对比统计 ──
+      let xgb_bal=cfg.initialCapital,xgb_cost=0,xgb_prize=0,xgb_wins=0;
+      const xgb_levelCounts={'1st':0,'2nd':0,'3rd':0,'4th':0,'5th':0,'6th':0,'Miss':0};
+      const xgb_equityCurve=[];  // 逐期余额，用于对比曲线
       const recs=[];
       const mc={lookBack:cfg.lookBack,unitsLSTM:64,dropout:0.2,useLayerNorm:true,temperature:1.0};
       for(let i=0;i<samples.length;i++){
         if(abortRef.current)break;
         const s=samples[i],ar=testData.find(d=>d.issue===s.meta.issue);
         if(!ar)continue;
-        const pred=await runInference(model,s.features,mc,cfg.useMCDropout);
+        // ── 选择推理结果 ──
+        let pred;
+        if(cfg.modelType==='xgboost' && xgbPreds){
+          const xp = xgbPreds.find(p=>p.issue===ar.issue);
+          pred = xp || await runInference(model,s.features,mc,cfg.useMCDropout);
+        } else if(cfg.modelType==='ensemble' && xgbPreds){
+          const lstmPred = await runInference(model,s.features,mc,cfg.useMCDropout);
+          const xp = xgbPreds.find(p=>p.issue===ar.issue);
+          if(xp){
+            // 集成：LSTM和XGBoost概率平均
+            pred = {
+              ...lstmPred,
+              redProbs: lstmPred.redProbs.map((p,i)=>(p+xp.redProbs[i])*0.5),
+              blueProbs: lstmPred.blueProbs.map((p,i)=>(p+xp.blueProbs[i])*0.5),
+            };
+          } else { pred = lstmPred; }
+        } else {
+          pred = await runInference(model,s.features,mc,cfg.useMCDropout);
+        }
         // ─ v1.4.0: 动态博弈决策，传入当期奖池和近10期拥挤度 ─
         const TOTAL_COMBOS=17721088;
         const recentForCrowd=testData.slice(Math.max(0,i-10),i);
@@ -3136,7 +3488,21 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
           // 随机基准对照
           randPrizeLevel:randResult.level, randPrize:randResult.prize, randCost:2
         });
-        if(i%5===0){setProg(((i+1)/samples.length)*100);setRecords([...recs]);setStatus(`回测中 ${i+1}/${samples.length}`);await tf.nextFrame();}
+        // ── v1.5.0 XGBoost 单式对比统计（始终用xgbPreds做1注单式比较）──
+        if(xgbPreds){
+          const xp = xgbPreds.find(p=>p.issue===ar.issue);
+          if(xp){
+            const xgbRed = xp.redTop6;
+            const xgbBlue = xp.blueTop1;
+            const xgbR = calcPrize(xgbRed, xgbBlue, [ar.red1,ar.red2,ar.red3,ar.red4,ar.red5,ar.red6], ar.blue);
+            xgb_bal = xgb_bal - 2 + xgbR.prize;
+            xgb_cost += 2; xgb_prize += xgbR.prize;
+            if(xgbR.prize>0) xgb_wins++;
+            xgb_levelCounts[xgbR.level] = (xgb_levelCounts[xgbR.level]||0)+1;
+            xgb_equityCurve.push({name:ar.issue, value:Math.round(xgb_bal)});
+          }
+        }
+        setProg(Math.round((i+1)/samples.length*100));setStatus(`回测中 ${i+1}/${samples.length} 期`);if(i%5===0){setRecords([...recs]);await tf.nextFrame();}
       }
       if(modelSrc==='browser')model.dispose();
       // 生存分析：连续N期至少中一次各等级奖的概率
@@ -3181,8 +3547,53 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
         betMode:cfg.betMode,
         avgCostPerPeriod: avgCostPerPeriod.toFixed(1),
         coverageRate:(recs.filter(r=>r.prize>0).length/Math.max(recs.length,1)*100).toFixed(1),
+        // ── v1.5.0 模型类型标记 ──
+        modelType: cfg.modelType,
       };
       setSummary(sm);setRecords(recs);setStatus('回测完成');
+      // ── v1.5.0 自动保存回测记录 ──
+      try{
+        const saved = JSON.parse(localStorage.getItem('ssq_bt_history')||'[]');
+        const newRec = {
+          id: Date.now(),
+          time: new Date().toLocaleString('zh-CN'),
+          modelType: cfg.modelType,
+          betMode: cfg.betMode,
+          lookBack: cfg.lookBack,
+          initialCapital: cfg.initialCapital,
+          testPeriods: recs.length,
+          roi: ((bal-cfg.initialCapital)/cfg.initialCapital*100).toFixed(2),
+          rtp: (prize/Math.max(cost,1)*100).toFixed(1),
+          winRate: (wins/recs.length*100).toFixed(2),
+          maxDrawdown: (maxDD*100).toFixed(1),
+          finalBalance: Math.round(bal),
+          levelCounts: {...levelCounts},
+          starred: false,
+          note: '',
+          cmpXgb: xgbPreds&&xgb_cost>0 ? {
+            winRate:(xgb_wins/recs.length*100).toFixed(2),
+            rtp:(xgb_prize/Math.max(xgb_cost,1)*100).toFixed(1),
+            finalBalance:Math.round(xgb_bal)
+          } : null,
+        };
+        const updated = [newRec, ...saved].slice(0,100); // 最多保留100条
+        localStorage.setItem('ssq_bt_history', JSON.stringify(updated));
+        // 立即更新 React state，让记录列表实时刷新
+        setBtHistory(updated);
+        // 容量检查
+        const usage = JSON.stringify(updated).length;
+        setStorageWarn(usage > 400000);
+      }catch(e){ console.warn('回测记录保存失败',e); }
+      // ── v1.5.0 生成对比结果（当xgbPreds存在时）──
+      if(xgbPreds && xgb_cost>0){
+        const n=recs.length;
+        setCmpResult({
+          lstm:{ winRate:(wins/n*100).toFixed(2), rtp:(prize/Math.max(cost,1)*100).toFixed(1), levelCounts, finalBalance:bal.toFixed(0) },
+          xgb:{ winRate:(xgb_wins/n*100).toFixed(2), rtp:(xgb_prize/Math.max(xgb_cost,1)*100).toFixed(1), levelCounts:xgb_levelCounts, finalBalance:xgb_bal.toFixed(0), equityCurve:xgb_equityCurve },
+          rand:{ winRate:(randWins/n*100).toFixed(2), rtp:(randPrizeTotal/Math.max(randCostTotal,1)*100).toFixed(1) },
+          n,
+        });
+      }
       const rtpNote = sm.officialRTP > 50
         ? `实际返奖率${sm.officialRTP.toFixed(1)}%，高于官方基准(50%)。模型RTP ${sm.edgeRTP>0?'超越':'低于'}随机基准${Math.abs(sm.edgeRTP).toFixed(1)}%。`
         : `实际返奖率${sm.officialRTP.toFixed(1)}%，低于官方基准(50%)，建议调整LookBack或温度参数后重新训练。`;
@@ -3197,14 +3608,79 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
   return h('div',{className:'grid grid-cols-1 lg:grid-cols-4 gap-6 pb-8'},
     h('div',{className:'space-y-4'},
       h('div',{className:'bg-white p-6 rounded-xl border border-slate-200 shadow-sm'},
-        h('h3',{className:'font-bold mb-3'},'1. 模型源'),
-        h('div',{className:'flex bg-slate-100 p-1 rounded mb-3'},
-          h('button',{onClick:()=>setModelSrc('external'),className:`flex-1 py-1 text-xs font-bold rounded ${modelSrc==='external'?'bg-white shadow text-indigo-600':'text-slate-500'}`},'外部 (Colab)'),
-          h('button',{onClick:()=>setModelSrc('browser'),className:`flex-1 py-1 text-xs font-bold rounded ${modelSrc==='browser'?'bg-white shadow text-indigo-600':'text-slate-500'}`},'浏览器 (测试)')
+        h('h3',{className:'font-bold mb-3'},'1. 模型源 & 类型'),
+        // ── v1.5.0 模型类型三选一 ──
+        h('div',{className:'mb-3'},
+          h('div',{className:'text-xs font-bold text-slate-500 mb-1.5'},'🤖 推理模型'),
+          h('div',{className:'flex bg-slate-100 p-1 rounded gap-0.5'},
+            [{t:'lstm',l:'LSTM'},{t:'xgboost',l:'XGBoost'},{t:'ensemble',l:'集成'}].map(({t,l})=>
+              h('button',{key:t,onClick:()=>setCfg(p=>({...p,modelType:t})),
+                className:'flex-1 py-1 text-xs font-bold rounded transition-all '+
+                  (cfg.modelType===t?'bg-white shadow text-indigo-600':'text-slate-500 hover:text-slate-700')
+              },l)
+            )
+          ),
+          h('div',{className:'text-xs text-slate-400 mt-1 px-0.5'},
+            cfg.modelType==='lstm'?'仅使用LSTM推理选号（需上传Colab模型）':
+            cfg.modelType==='xgboost'?'仅使用XGBoost推理选号（无需LSTM）':
+            '两模型概率平均后选号（需两者都就绪）'
+          )
         ),
-        modelSrc==='external'&&h('div',{className:'border-2 border-dashed border-slate-300 rounded p-4 text-center relative hover:bg-slate-50 bg-slate-50',style:{minHeight:70}},
-          h('input',{type:'file',multiple:true,accept:'.json,.bin',onChange:handleMUpload,style:{position:'absolute',inset:0,width:'100%',height:'100%',opacity:0,cursor:'pointer'}}),
-          externalModel?h('div',{className:'text-green-600 text-sm font-bold py-2'},'✓ 已加载模型'):h('div',{className:'text-slate-400 text-sm py-2'},'↑ 上传 model.json + .bin')
+        // LSTM 模型源（仅 lstm/ensemble 时显示）
+        (cfg.modelType==='lstm'||cfg.modelType==='ensemble')&&h('div',{className:'mb-3'},
+          h('div',{className:'text-xs font-bold text-slate-500 mb-1'},
+            cfg.modelType==='ensemble'?'LSTM 模型 (集成左侧)':'LSTM 模型'),
+          h('div',{className:'flex bg-slate-100 p-1 rounded mb-2'},
+            h('button',{onClick:()=>setModelSrc('external'),className:'flex-1 py-1 text-xs font-bold rounded '+(modelSrc==='external'?'bg-white shadow text-indigo-600':'text-slate-500')},'外部 (Colab)'),
+            h('button',{onClick:()=>setModelSrc('browser'),className:'flex-1 py-1 text-xs font-bold rounded '+(modelSrc==='browser'?'bg-white shadow text-indigo-600':'text-slate-500')},'浏览器 (测试)')
+          ),
+          modelSrc==='external'&&h('div',{className:'border-2 border-dashed border-slate-300 rounded p-3 text-center relative hover:bg-slate-50 bg-slate-50',style:{minHeight:60}},
+            h('input',{type:'file',multiple:true,accept:'.json,.bin',onChange:handleMUpload,style:{position:'absolute',inset:0,width:'100%',height:'100%',opacity:0,cursor:'pointer'}}),
+            externalModel?h('div',{className:'text-green-600 text-sm font-bold py-1'},'✓ LSTM已加载'):h('div',{className:'text-slate-400 text-sm py-1'},'↑ 上传 model.json + .bin')
+          )
+        ),
+        // XGBoost 训练面板（仅 xgboost/ensemble 时显示）
+        (cfg.modelType==='xgboost'||cfg.modelType==='ensemble')&&h('div',{className:'border border-emerald-200 bg-emerald-50 rounded-lg p-3'},
+          h('div',{className:'flex items-center justify-between mb-2'},
+            h('span',{className:'text-xs font-bold text-emerald-800'},
+              cfg.modelType==='ensemble'?'XGBoost 模型 (集成右侧)':'XGBoost 模型'),
+            xgbModel&&h('span',{className:'text-xs text-emerald-600 font-bold'},'✓ 已就绪')
+          ),
+          // XGBoost 超参数
+          h('div',{className:'grid grid-cols-3 gap-1 mb-2'},
+            h('div',{},
+              h('label',{className:'text-xs text-slate-500 block'},'轮数'),
+              h('select',{value:cfg.xgbNTrees,onChange:e=>setCfg(p=>({...p,xgbNTrees:+e.target.value})),
+                className:'w-full text-xs border rounded px-1 py-0.5 bg-white'},
+                [20,30,40,60,80].map(v=>h('option',{key:v,value:v},v+'轮'))
+              )
+            ),
+            h('div',{},
+              h('label',{className:'text-xs text-slate-500 block'},'深度'),
+              h('select',{value:cfg.xgbMaxDepth,onChange:e=>setCfg(p=>({...p,xgbMaxDepth:+e.target.value})),
+                className:'w-full text-xs border rounded px-1 py-0.5 bg-white'},
+                [3,4,5,6].map(v=>h('option',{key:v,value:v},'深度'+v))
+              )
+            ),
+            h('div',{},
+              h('label',{className:'text-xs text-slate-500 block'},'学习率'),
+              h('select',{value:cfg.xgbLR,onChange:e=>setCfg(p=>({...p,xgbLR:+e.target.value})),
+                className:'w-full text-xs border rounded px-1 py-0.5 bg-white'},
+                [{v:0.05,l:'0.05'},{v:0.1,l:'0.1'},{v:0.15,l:'0.15'},{v:0.2,l:'0.2'}].map(({v,l})=>h('option',{key:v,value:v},l))
+              )
+            )
+          ),
+          h('button',{onClick:handleTrainXGB,disabled:xgbTraining||data.filter(d=>d.usage==='train').length<10,
+            className:'w-full py-2 rounded text-xs font-bold transition-all '+
+              (xgbTraining?'bg-slate-100 text-slate-400':'bg-emerald-600 text-white hover:bg-emerald-700')},
+            xgbTraining?'训练中...':'🌲 训练 XGBoost'
+          ),
+          xgbTraining&&h('div',{className:'mt-1.5'},
+            h('div',{className:'w-full bg-slate-200 rounded-full h-1.5'},
+              h('div',{className:'bg-emerald-500 h-1.5 rounded-full transition-all',style:{width:xgbProg+'%'}})
+            )
+          ),
+          (xgbStatus)&&h('div',{className:'text-xs text-emerald-700 mt-1 text-center'},xgbStatus)
         )
       ),
       h('div',{className:'bg-white p-6 rounded-xl border border-slate-200 shadow-sm'},
@@ -3360,8 +3836,17 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
           h('div',{},h('label',{className:'text-xs font-bold text-slate-500 block mb-1'},'LookBack'),h('select',{value:cfg.lookBack,onChange:e=>setCfg({...cfg,lookBack:+e.target.value}),className:'w-full border rounded px-3 py-2 text-sm bg-white'},[10,20,30].map(v=>h('option',{key:v,value:v},`${v}期`)))),
           h('div',{className:'flex items-center justify-between bg-indigo-50 p-2 rounded border border-indigo-100'},h('span',{className:'text-xs font-bold text-indigo-800'},'MC Dropout'),h('input',{type:'checkbox',checked:cfg.useMCDropout,onChange:e=>setCfg({...cfg,useMCDropout:e.target.checked}),className:'accent-indigo-600'})),
           h('button',{onClick:runBT,disabled:running,className:`w-full py-3 rounded-lg font-bold flex items-center justify-center gap-2 ${running?'bg-slate-100 text-slate-400':'bg-indigo-600 text-white hover:bg-indigo-700'}`},running?'回测中...':'▶ 开始回测'),
-          running&&h('div',{className:'w-full bg-slate-100 rounded-full h-1.5'},h('div',{className:'bg-indigo-500 h-1.5 rounded-full transition-all',style:{width:`${prog}%`}})),
-          h('div',{className:'text-center text-xs text-slate-400 min-h-4'},status)
+          running&&h('div',{className:'space-y-1'},
+            h('div',{className:'flex justify-between text-xs text-slate-500 mb-0.5'},
+              h('span',{},status),
+              h('span',{className:'font-mono font-bold text-indigo-600'},prog.toFixed(0)+'%')
+            ),
+            h('div',{className:'w-full bg-slate-100 rounded-full h-2.5 overflow-hidden'},
+              h('div',{className:'bg-indigo-500 h-2.5 rounded-full transition-all duration-300',
+                style:{width:prog+'%',minWidth:prog>0?'4px':'0'}})
+            )
+          ),
+          !running&&h('div',{className:'text-center text-xs text-slate-400 min-h-4'},status)
         )
       ),
       summary&&h('div',{className:'space-y-3'},
@@ -3471,13 +3956,143 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
     ),
     h('div',{className:'lg:col-span-3 flex flex-col gap-6'},
       h('div',{className:'bg-white p-6 rounded-xl border border-slate-200 shadow-sm'},
-        h('h3',{className:'text-sm font-bold text-slate-500 uppercase mb-4'},'资金权益曲线'),
+        h('div',{className:'flex items-center justify-between mb-4'},
+          h('h3',{className:'text-sm font-bold text-slate-500 uppercase'},'资金权益曲线'),
+          h('span',{className:'text-xs px-2 py-0.5 rounded-full font-bold '+
+            (cfg.modelType==='lstm'?'bg-indigo-100 text-indigo-700':
+             cfg.modelType==='xgboost'?'bg-emerald-100 text-emerald-700':
+             'bg-violet-100 text-violet-700')},
+            cfg.modelType==='lstm'?'🧠 LSTM驱动':cfg.modelType==='xgboost'?'🌲 XGBoost驱动':'⚡ 集成驱动'
+          )
+        ),
         records.length>0?h('div',{style:{height:240}},h(AreaChart,{data:eqData,height:240}))
         :h('div',{style:{height:240},className:'flex flex-col items-center justify-center bg-slate-50 border-2 border-dashed rounded-lg'},h('div',{style:{fontSize:48,color:'#cbd5e1'}},'📈'),h('p',{className:'text-slate-400 text-sm font-bold mt-2'},'暂无回测数据'))
       ),
       diagnosis&&h('div',{className:'bg-indigo-50 border border-indigo-100 p-4 rounded text-sm text-indigo-800'},h('span',{className:'font-bold'},'AI诊断: '),diagnosis),
+      // ── v1.5.0 模型对比面板 ──
+      cmpResult&&h('div',{className:'bg-white p-6 rounded-xl border border-slate-200 shadow-sm'},
+        h('div',{className:'flex items-center gap-2 mb-4'},
+          h('h3',{className:'font-bold text-slate-800'},'🔬 v1.5.0 模型对照实验'),
+          h('span',{className:'text-xs bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full font-bold'},'NEW')
+        ),
+        h('p',{className:'text-xs text-slate-400 mb-4'},'相同测试集('+cmpResult.n+'期)、相同投注策略(单式1注)，对比各模型实际表现'),
+        // 三列对比表
+        h('div',{className:'grid grid-cols-3 gap-3 mb-4'},
+          [
+            {key:'lstm',label:'LSTM',icon:'🧠',color:'text-indigo-700',bg:'bg-indigo-50',border:'border-indigo-200',data:cmpResult.lstm},
+            {key:'xgb',label:'XGBoost',icon:'🌲',color:'text-emerald-700',bg:'bg-emerald-50',border:'border-emerald-200',data:cmpResult.xgb},
+            {key:'rand',label:'随机基准',icon:'🎲',color:'text-slate-600',bg:'bg-slate-50',border:'border-slate-200',data:cmpResult.rand},
+          ].map(({key,label,icon,color,bg,border,data})=>
+            h('div',{key,className:'rounded-lg p-3 border '+bg+' '+border},
+              h('div',{className:'text-center mb-2'},
+                h('div',{style:{fontSize:24}},icon),
+                h('div',{className:'text-xs font-bold '+color},label)
+              ),
+              h('div',{className:'space-y-1.5'},
+                h('div',{className:'flex justify-between text-xs'},
+                  h('span',{className:'text-slate-500'},'中奖率'),
+                  h('span',{className:'font-bold font-mono '+color},data.winRate+'%')
+                ),
+                h('div',{className:'flex justify-between text-xs'},
+                  h('span',{className:'text-slate-500'},'RTP'),
+                  h('span',{className:'font-bold font-mono '+(+data.rtp>=50?'text-green-600':'text-slate-500')},data.rtp+'%')
+                ),
+                data.finalBalance&&h('div',{className:'flex justify-between text-xs'},
+                  h('span',{className:'text-slate-500'},'最终余额'),
+                  h('span',{className:'font-bold font-mono '+color},'¥'+parseInt(data.finalBalance).toLocaleString())
+                )
+              )
+            )
+          )
+        ),
+        // 等级分布对比（LSTM vs XGBoost）
+        h('div',{className:'border-t pt-4'},
+          h('div',{className:'text-xs font-bold text-slate-500 mb-2'},'中奖等级分布对比（LSTM vs XGBoost）'),
+          h('table',{className:'w-full text-xs'},
+            h('thead',{},h('tr',{className:'text-slate-400 border-b'},
+              h('th',{className:'text-left py-1 font-medium'},'等级'),
+              h('th',{className:'text-right py-1 font-medium text-indigo-600'},'🧠 LSTM'),
+              h('th',{className:'text-right py-1 font-medium text-emerald-600'},'🌲 XGBoost'),
+              h('th',{className:'text-right py-1 font-medium'},'差值')
+            )),
+            h('tbody',{},
+              [['一等奖','1st'],['二等奖','2nd'],['三等奖','3rd'],['四等奖','4th'],['五等奖','5th'],['六等奖','6th'],['未中','Miss']].map(([lbl,k])=>{
+                const lv=cmpResult.lstm.levelCounts[k]||0;
+                const xv=cmpResult.xgb.levelCounts[k]||0;
+                const diff=lv-xv;
+                return h('tr',{key:k,className:'border-b border-slate-50 hover:bg-slate-50'},
+                  h('td',{className:'py-1 text-slate-600'},lbl),
+                  h('td',{className:'text-right py-1 font-mono font-bold text-indigo-600'},lv+'次'),
+                  h('td',{className:'text-right py-1 font-mono font-bold text-emerald-600'},xv+'次'),
+                  h('td',{className:'text-right py-1 font-mono text-xs '+(diff>0?'text-indigo-400':diff<0?'text-emerald-500':'text-slate-300')},
+                    diff>0?'+'+diff:diff===0?'—':diff
+                  )
+                );
+              })
+            )
+          )
+        ),
+        // ── 双曲线对比图（主模型 vs XGBoost 资金走势）──
+        cmpResult.xgb.equityCurve&&cmpResult.xgb.equityCurve.length>1&&h('div',{className:'border-t pt-4 mt-4'},
+          h('div',{className:'text-xs font-bold text-slate-500 mb-1'},'资金走势对比（主模型 vs XGBoost 单式对比）'),
+          h('div',{className:'text-xs text-slate-400 mb-2'},
+            '主模型曲线（'+
+              (cfg.modelType==='lstm'?'🧠 LSTM':cfg.modelType==='xgboost'?'🌲 XGBoost':'⚡ 集成')+
+            '）为选择的投注策略；XGBoost曲线始终为单式1注对比基准'
+          ),
+          h('div',{style:{height:140,position:'relative',overflow:'hidden'}},(()=>{
+            const mainData = records.map(r=>r.balance);
+            const xgbData  = cmpResult.xgb.equityCurve.map(d=>d.value);
+            const allVals  = [...mainData, ...xgbData];
+            const minV=Math.min(...allVals), maxV=Math.max(...allVals), range=maxV-minV||1;
+            const W=600, H=120;
+            const toY = v => H - ((v-minV)/range)*H;
+            const toPts = arr => arr.map((v,i)=>`${(i/(arr.length-1||1))*W},${toY(v)}`).join(' ');
+            const mainPts = toPts(mainData);
+            const xgbPts  = toPts(xgbData);
+            const mainColor = cfg.modelType==='lstm'?'#6366f1':cfg.modelType==='xgboost'?'#10b981':'#8b5cf6';
+            return h('svg',{viewBox:`0 0 ${W} ${H+20}`,preserveAspectRatio:'none',style:{width:'100%',height:'100%'}},
+              h('defs',{},
+                h('linearGradient',{id:'cmpGrad1',x1:'0',y1:'0',x2:'0',y2:'1'},
+                  h('stop',{offset:'0%',stopColor:mainColor,stopOpacity:0.15}),
+                  h('stop',{offset:'100%',stopColor:mainColor,stopOpacity:0})
+                )
+              ),
+              h('path',{d:`M0,${H} L${mainPts.split(' ').join(' L')} L${W},${H} Z`,fill:'url(#cmpGrad1)'}),
+              h('polyline',{points:mainPts,fill:'none',stroke:mainColor,strokeWidth:2}),
+              h('polyline',{points:xgbPts, fill:'none',stroke:'#10b981',strokeWidth:1.5,strokeDasharray:'4 2'}),
+              h('text',{x:4,y:12,fontSize:9,fill:mainColor,fontWeight:'bold'},
+                cfg.modelType==='lstm'?'LSTM':cfg.modelType==='xgboost'?'XGBoost(主)':'集成'),
+              h('text',{x:4,y:22,fontSize:9,fill:'#10b981'},'- - XGBoost(基准)')
+            );
+          })())
+        ),
+        // 综合结论
+        h('div',{className:'mt-3 p-3 rounded-lg bg-slate-50 text-xs text-slate-600'},
+          (()=>{
+            const lstmRtp=+cmpResult.lstm.rtp, xgbRtp=+cmpResult.xgb.rtp, randRtp=+cmpResult.rand.rtp;
+            const winner = lstmRtp>=xgbRtp ? 'LSTM' : 'XGBoost';
+            const edge = Math.abs(lstmRtp-xgbRtp).toFixed(1);
+            const bothBeatRand = lstmRtp>randRtp && xgbRtp>randRtp;
+            return h('span',{},
+              h('span',{className:'font-bold'},'实验结论：'),
+              winner+'在此测试集上RTP更高，领先'+edge+'%。',
+              bothBeatRand?' 两模型均超越随机基准，集成方案可进一步提升稳健性。':
+              ' 注意：至少一个模型未超越随机基准，建议调整超参后重新对比。'
+            );
+          })()
+        )
+      ),
       h('div',{className:'bg-white rounded-lg border shadow-sm flex-1 overflow-hidden',style:{minHeight:300}},
-        h('div',{className:'px-6 py-3 border-b font-bold text-sm bg-slate-50'},'交易日志'),
+        h('div',{className:'px-6 py-3 border-b bg-slate-50 flex items-center justify-between'},
+          h('span',{className:'font-bold text-sm'},'交易日志'),
+          h('span',{className:'text-xs px-2 py-0.5 rounded-full font-bold '+
+            (cfg.modelType==='lstm'?'bg-indigo-100 text-indigo-700':
+             cfg.modelType==='xgboost'?'bg-emerald-100 text-emerald-700':
+             'bg-violet-100 text-violet-700')},
+            cfg.modelType==='lstm'?'🧠 LSTM选号':cfg.modelType==='xgboost'?'🌲 XGBoost选号':'⚡ 集成选号'
+          )
+        ),
         h('div',{style:{maxHeight:400,overflowY:'auto'}},
           h('table',{className:'w-full text-xs'},
             h('thead',{className:'bg-slate-50 sticky top-0'},
@@ -3533,6 +4148,216 @@ function BacktestLab({data,records,setRecords,summary,setSummary,externalModel,s
             )
           )
         )
+      ),
+      // v1.5.0 回测记录区域（交易日志正下方，同宽）
+      h('div',{className:'w-full'},
+
+      // ── 删除确认弹窗 ──
+      deleteConfirm&&h('div',{className:'fixed inset-0 z-50 flex items-center justify-center',style:{background:'rgba(0,0,0,0.45)'}},
+        h('div',{className:'bg-white rounded-2xl shadow-2xl p-8 max-w-sm w-full mx-4'},
+          h('div',{className:'text-center mb-5'},
+            h('div',{style:{fontSize:48}},'🗑️'),
+            h('h3',{className:'text-lg font-bold text-slate-800 mt-2'},'确认删除'),
+            h('p',{className:'text-sm text-slate-500 mt-2'},
+              deleteConfirm.single
+                ? '确定要删除这条回测记录吗？此操作不可撤销。'
+                : `确定要删除选中的 ${deleteConfirm.ids.length} 条回测记录吗？此操作不可撤销。`
+            )
+          ),
+          h('div',{className:'flex gap-3'},
+            h('button',{onClick:()=>setDeleteConfirm(null),
+              className:'flex-1 py-2.5 rounded-xl border border-slate-200 text-slate-600 font-bold hover:bg-slate-50'},'取消'),
+            h('button',{onClick:()=>executeDelete(deleteConfirm.ids),
+              className:'flex-1 py-2.5 rounded-xl bg-red-500 text-white font-bold hover:bg-red-600'},'确认删除')
+          )
+        )
+      ),
+
+      h('div',{className:'bg-white rounded-xl border border-slate-200 shadow-sm'},
+        // ── 标题栏 ──
+        h('div',{className:'px-6 py-4 border-b bg-slate-50 flex items-center justify-between flex-wrap gap-3'},
+          h('div',{className:'flex items-center gap-3'},
+            h('span',{className:'font-bold text-slate-800'},'📋 回测记录'),
+            h('span',{className:'text-xs bg-slate-200 text-slate-500 px-2 py-0.5 rounded-full font-mono'},
+              btHistory.length+'/100条'),
+            storageWarn&&h('span',{className:'text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-bold animate-pulse'},
+              '⚠️ 存储超80%，请及时清理')
+          ),
+          h('div',{className:'flex items-center gap-2'},
+            // 多选时的批量操作
+            selectedIds.size>0&&h('div',{className:'flex items-center gap-2'},
+              h('span',{className:'text-xs text-slate-500'},'已选'+selectedIds.size+'条'),
+              h('button',{
+                onClick:()=>confirmDelete([...selectedIds]),
+                className:'text-xs px-3 py-1.5 bg-red-50 text-red-600 border border-red-200 rounded-lg font-bold hover:bg-red-100'
+              },'🗑 删除选中'),
+              h('button',{onClick:()=>setSelectedIds(new Set()),
+                className:'text-xs px-3 py-1.5 bg-slate-100 text-slate-500 rounded-lg hover:bg-slate-200'},'取消选择')
+            ),
+            h('button',{onClick:refreshHistory,
+              className:'text-xs px-3 py-1.5 bg-white border border-slate-200 text-slate-500 rounded-lg hover:bg-slate-50'},'↻ 刷新')
+          )
+        ),
+
+        // ── 横向比较面板（≥2条选中时出现）──
+        selectedIds.size>=2&&(()=>{
+          const compared=btHistory.filter(r=>selectedIds.has(r.id));
+          const metrics=[
+            {k:'roi',l:'ROI',unit:'%',better:'high'},
+            {k:'rtp',l:'RTP',unit:'%',better:'high'},
+            {k:'winRate',l:'中奖率',unit:'%',better:'high'},
+            {k:'maxDrawdown',l:'最大回撤',unit:'%',better:'low'},
+            {k:'finalBalance',l:'最终余额',unit:'¥',better:'high'},
+          ];
+          const modelLabel=t=>t==='lstm'?'🧠 LSTM':t==='xgboost'?'🌲 XGB':'⚡ 集成';
+          return h('div',{className:'border-b'},
+            h('div',{className:'px-6 py-3 bg-indigo-50 border-b border-indigo-100 flex items-center gap-2'},
+              h('span',{className:'text-xs font-bold text-indigo-700'},'⚡ 横向比较'),
+              h('span',{className:'text-xs text-indigo-500'},`（${compared.length}条记录对比）`),
+              h('button',{onClick:()=>setSelectedIds(new Set()),
+                className:'ml-auto text-xs text-indigo-400 hover:text-indigo-600'},'关闭')
+            ),
+            h('div',{className:'overflow-x-auto'},
+              h('table',{className:'w-full text-xs'},
+                h('thead',{},
+                  h('tr',{className:'bg-indigo-50'},
+                    h('th',{className:'px-4 py-2 text-left text-slate-500 font-medium sticky left-0 bg-indigo-50'},'指标'),
+                    ...compared.map(r=>h('th',{key:r.id,className:'px-4 py-2 text-center min-w-32'},
+                      h('div',{className:'font-bold text-slate-700'},modelLabel(r.modelType)),
+                      h('div',{className:'font-normal text-slate-400 text-xs'},r.time.slice(5)),
+                      r.starred&&h('span',{className:'text-yellow-500'},' ★')
+                    ))
+                  )
+                ),
+                h('tbody',{},
+                  metrics.map(({k,l,unit,better})=>{
+                    const vals=compared.map(r=>+r[k]);
+                    const best=better==='high'?Math.max(...vals):Math.min(...vals);
+                    return h('tr',{key:k,className:'border-t border-slate-100'},
+                      h('td',{className:'px-4 py-2 text-slate-500 font-medium sticky left-0 bg-white'},l),
+                      ...compared.map((r,i)=>{
+                        const v=+r[k];
+                        const isBest=v===best&&vals.filter(x=>x===best).length<compared.length;
+                        return h('td',{key:r.id,className:'px-4 py-2 text-center font-mono font-bold '+
+                          (isBest?'text-emerald-600 bg-emerald-50':'text-slate-600')},
+                          (unit==='¥'?'¥'+v.toLocaleString():v+'%')
+                        );
+                      })
+                    );
+                  })
+                )
+              )
+            )
+          );
+        })(),
+
+        // ── 记录列表 ──
+        btHistory.length===0
+          ? h('div',{className:'px-6 py-12 text-center text-slate-400'},
+              h('div',{style:{fontSize:48}},'📭'),
+              h('p',{className:'mt-2 text-sm font-medium'},'暂无回测记录'),
+              h('p',{className:'text-xs mt-1'},'完成一次回测后自动保存')
+            )
+          : h('div',{className:'divide-y divide-slate-100'},
+              // 全选行
+              h('div',{className:'px-4 py-2 bg-slate-50 flex items-center gap-2 text-xs text-slate-500'},
+                h('input',{type:'checkbox',
+                  checked:selectedIds.size===btHistory.length&&btHistory.length>0,
+                  onChange:toggleSelectAll,
+                  className:'accent-indigo-600 w-3.5 h-3.5'}),
+                h('span',{},'全选'),
+                h('span',{className:'ml-4 text-slate-400'},'点击行可选中；选中2条以上自动显示横向比较')
+              ),
+              ...btHistory.map(r=>{
+                const isSelected=selectedIds.has(r.id);
+                const modelColor=r.modelType==='lstm'?'text-indigo-600 bg-indigo-50':
+                                 r.modelType==='xgboost'?'text-emerald-600 bg-emerald-50':
+                                 'text-violet-600 bg-violet-50';
+                const modelLabel=r.modelType==='lstm'?'LSTM':r.modelType==='xgboost'?'XGBoost':'集成';
+                const betLabel=r.betMode==='single'?'单式':r.betMode==='compound'?'复式':
+                               r.betMode==='dangtuo'?'胆拖':'动态';
+                return h('div',{key:r.id,
+                  className:'px-4 py-3 hover:bg-slate-50 transition-colors cursor-pointer '+
+                    (isSelected?'bg-indigo-50/60 border-l-2 border-indigo-400':'border-l-2 border-transparent'),
+                  onClick:()=>toggleSelect(r.id)
+                },
+                  h('div',{className:'flex items-start gap-3'},
+                    // 复选框
+                    h('input',{type:'checkbox',checked:isSelected,onChange:()=>toggleSelect(r.id),
+                      className:'accent-indigo-600 w-4 h-4 mt-0.5 flex-shrink-0',
+                      onClick:e=>e.stopPropagation()}),
+                    // 星标
+                    h('button',{
+                      onClick:e=>{e.stopPropagation();toggleStar(r.id);},
+                      className:'text-lg flex-shrink-0 mt-0.5 hover:scale-110 transition-transform',
+                      title:'标记重点关注'
+                    }, r.starred?'★':'☆'),
+                    // 主要内容
+                    h('div',{className:'flex-1 min-w-0'},
+                      // 第一行：时间 + 模型标签 + 投注方式
+                      h('div',{className:'flex items-center gap-2 flex-wrap mb-1.5'},
+                        h('span',{className:'text-xs text-slate-400 font-mono'},r.time),
+                        h('span',{className:'text-xs font-bold px-1.5 py-0.5 rounded '+modelColor},modelLabel),
+                        h('span',{className:'text-xs px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 font-medium'},
+                          betLabel),
+                        h('span',{className:'text-xs text-slate-400'},'LB'+r.lookBack),
+                        h('span',{className:'text-xs text-slate-400'},r.testPeriods+'期'),
+                        r.starred&&h('span',{className:'text-xs text-yellow-600 font-bold'},'★ 重点关注')
+                      ),
+                      // 第二行：核心指标
+                      h('div',{className:'flex items-center gap-4 flex-wrap'},
+                        h('div',{className:'flex items-center gap-1'},
+                          h('span',{className:'text-xs text-slate-400'},'ROI'),
+                          h('span',{className:'text-xs font-bold font-mono '+
+                            (+r.roi>=0?'text-red-500':'text-green-600')},
+                            (+r.roi>=0?'+':'')+r.roi+'%')
+                        ),
+                        h('div',{className:'flex items-center gap-1'},
+                          h('span',{className:'text-xs text-slate-400'},'RTP'),
+                          h('span',{className:'text-xs font-bold font-mono '+
+                            (+r.rtp>=50?'text-green-600':'text-slate-500')},r.rtp+'%')
+                        ),
+                        h('div',{className:'flex items-center gap-1'},
+                          h('span',{className:'text-xs text-slate-400'},'中奖率'),
+                          h('span',{className:'text-xs font-bold font-mono text-slate-700'},r.winRate+'%')
+                        ),
+                        h('div',{className:'flex items-center gap-1'},
+                          h('span',{className:'text-xs text-slate-400'},'回撤'),
+                          h('span',{className:'text-xs font-bold font-mono text-red-400'},'-'+r.maxDrawdown+'%')
+                        ),
+                        h('div',{className:'flex items-center gap-1'},
+                          h('span',{className:'text-xs text-slate-400'},'余额'),
+                          h('span',{className:'text-xs font-bold font-mono text-slate-700'},
+                            '¥'+r.finalBalance.toLocaleString())
+                        ),
+                        r.cmpXgb&&h('div',{className:'flex items-center gap-1'},
+                          h('span',{className:'text-xs text-emerald-500 font-bold'},'XGB'),
+                          h('span',{className:'text-xs font-mono text-emerald-600'},r.cmpXgb.rtp+'%')
+                        )
+                      ),
+                      // 第三行：备注（可编辑）
+                      h('div',{className:'mt-1.5',onClick:e=>e.stopPropagation()},
+                        h('input',{
+                          type:'text',
+                          value:r.note||'',
+                          onChange:e=>updateNote(r.id, e.target.value),
+                          placeholder:'添加备注…',
+                          className:'w-full text-xs text-slate-500 bg-transparent border-none outline-none placeholder-slate-300 hover:bg-slate-100 focus:bg-white focus:border focus:border-indigo-200 rounded px-1 py-0.5 transition-all',
+                          style:{maxWidth:500}
+                        })
+                      )
+                    ),
+                    // 删除按钮
+                    h('button',{
+                      onClick:e=>{e.stopPropagation();confirmDelete([r.id],true);},
+                      className:'flex-shrink-0 text-slate-300 hover:text-red-400 transition-colors px-1',
+                      title:'删除此记录'
+                    },'✕')
+                  )
+                );
+              })
+            )
+      )
       )
     )
   );
@@ -3695,92 +4520,410 @@ function generateDecisionPlan(inferResult, poolStatus, crowdSignal, quadrant, ba
 }
 
 
+
 function DecisionLab({data, activeModel, inferenceResult, btSum, btRecs}){
-  const {useState,useMemo,useCallback}=React;
-  const [baseBudget, setBaseBudget]=useState(100);
-  const [plan, setPlan]=useState(null);
-  const [computing, setComputing]=useState(false);
-  const [showHist, setShowHist]=useState(false);
-  const [histData, setHistData]=useState(null);
+  const {useState,useMemo,useCallback,useEffect,useRef}=React;
+  const [baseBudget,setBaseBudget]=useState(100);
+  const [plan,setPlan]=useState(null);
+  const [computing,setComputing]=useState(false);
+  const [showHist,setShowHist]=useState(false);
+  const [histData,setHistData]=useState(null);
+  const [aiReport,setAiReport]=useState(null);
+  const [aiLoading,setAiLoading]=useState(false);
+  const [aiError,setAiError]=useState('');
+  const [apiKey,setApiKey]=useState(()=>{try{return localStorage.getItem('ssq_gemini_key')||'';}catch(e){return '';}});
+  const [showKeyInput,setShowKeyInput]=useState(false);
+  // AI报告记录
+  const [aiHistory,setAiHistory]=useState(()=>{try{return JSON.parse(localStorage.getItem('ssq_ai_history')||'[]');}catch(e){return [];}});
+  const [viewingReport,setViewingReport]=useState(null); // null=当前报告, id=查看历史
+  const [deleteConfirm,setDeleteConfirm]=useState(null);
 
-  // 按时间排序
-  const sorted=useMemo(()=>{
-    if(!data||data.length===0) return [];
-    return [...data].sort((a,b)=>new Date(a.date)-new Date(b.date));
-  },[data]);
-
+  const btHistory=useMemo(()=>{try{return JSON.parse(localStorage.getItem('ssq_bt_history')||'[]');}catch(e){return [];}});
+  const sorted=useMemo(()=>[...data].sort((a,b)=>new Date(a.date)-new Date(b.date)),[data]);
   const latest=sorted.length>0?sorted[sorted.length-1]:null;
 
-  // streak depth（连续未开一等奖期数）
   const streakDepth=useMemo(()=>{
     let s=0;
-    for(let i=0;i<sorted.length-1;i++){
-      const d=sorted[i];
-      if(d.prize1Count!=null) s=d.prize1Count>0?0:s+1;
-    }
+    for(let i=0;i<sorted.length-1;i++){const d=sorted[i];if(d.prize1Count!=null)s=d.prize1Count>0?0:s+1;}
     return s;
   },[sorted]);
 
-  // 奖池状态
   const poolStatus=useMemo(()=>{
-    if(!latest) return{level:'unknown',label:'无数据',score:0,color:'text-slate-400',bg:'bg-slate-50',border:'border-slate-200'};
-    const jp=latest.jackpot||0; const sk=streakDepth;
-    if(jp>1.5e9||sk>=5) return{level:'mega', label:'超级积累 >15亿',score:1.0, color:'text-red-600',   bg:'bg-red-50',   border:'border-red-200'};
-    if(jp>8e8  ||sk>=3) return{level:'large',label:'大额积累 >8亿', score:0.75,color:'text-orange-600',bg:'bg-orange-50',border:'border-orange-200'};
-    if(jp>3e8  ||sk>=1) return{level:'medium',label:'奖池积累 >3亿',score:0.5, color:'text-amber-600', bg:'bg-amber-50', border:'border-amber-200'};
-    return              {level:'normal',label:'普通奖期 <3亿',  score:0.25,color:'text-slate-500', bg:'bg-slate-50', border:'border-slate-200'};
+    if(!latest)return{level:'unknown',label:'无数据',score:0,color:'text-slate-400',bg:'bg-slate-50',border:'border-slate-200'};
+    const jp=latest.jackpot||0,sk=streakDepth;
+    if(jp>1.5e9||sk>=5)return{level:'mega',label:'超级积累 >15亿',score:1.0,color:'text-red-600',bg:'bg-red-50',border:'border-red-200'};
+    if(jp>8e8||sk>=3)return{level:'large',label:'大额积累 >8亿',score:0.75,color:'text-orange-600',bg:'bg-orange-50',border:'border-orange-200'};
+    if(jp>3e8||sk>=1)return{level:'medium',label:'奖池积累 >3亿',score:0.5,color:'text-amber-600',bg:'bg-amber-50',border:'border-amber-200'};
+    return{level:'normal',label:'普通奖期 <3亿',score:0.25,color:'text-slate-500',bg:'bg-slate-50',border:'border-slate-200'};
   },[latest,streakDepth]);
 
-  // 拥挤度信号（近10期实测均值）
   const crowdSignal=useMemo(()=>{
-    if(sorted.length<5) return{norm:0.5,label:'数据不足',trend:'unknown',color:'text-slate-400'};
-    const TOTAL=17721088;
-    const recent=sorted.slice(-10);
-    const ratios=recent.map(d=>{
-      const sl=d.sales||0; const p1=d.prize1Count;
-      if(sl<=0||p1==null) return null;
-      const ew=(sl/2)/TOTAL;
-      return ew>0.05?p1/ew:null;
-    }).filter(x=>x!=null);
-    if(ratios.length===0) return{norm:0.5,label:'数据不足',trend:'unknown',color:'text-slate-400'};
-    const maxC=20;
-    const avg=ratios.reduce((s,v)=>s+v,0)/ratios.length;
-    const norm=Math.min(avg/maxC,1);
+    if(sorted.length<5)return{norm:0.5,label:'数据不足',trend:'unknown',color:'text-slate-400',trendLabel:''};
+    const TOTAL=17721088,recent=sorted.slice(-10);
+    const ratios=recent.map(d=>{const sl=d.sales||0,p1=d.prize1Count;if(sl<=0||p1==null)return null;const ew=(sl/2)/TOTAL;return ew>0.05?p1/ew:null;}).filter(x=>x!=null);
+    if(ratios.length===0)return{norm:0.5,label:'数据不足',trend:'unknown',color:'text-slate-400',trendLabel:''};
+    const avg=ratios.reduce((s,v)=>s+v,0)/ratios.length,norm=Math.min(avg/20,1);
     let trend='stable',trendLabel='→ 平稳';
-    if(ratios.length>=6){
-      const r3=ratios.slice(-3).reduce((s,v)=>s+v,0)/3;
-      const p3=ratios.slice(-6,-3).reduce((s,v)=>s+v,0)/3;
-      if(r3>p3*1.15){trend='rising';trendLabel='↗ 上升';}
-      else if(r3<p3*0.85){trend='falling';trendLabel='↘ 下降';}
-    }
+    if(ratios.length>=6){const r3=ratios.slice(-3).reduce((s,v)=>s+v,0)/3,p3=ratios.slice(-6,-3).reduce((s,v)=>s+v,0)/3;if(r3>p3*1.15){trend='rising';trendLabel='↗ 上升';}else if(r3<p3*0.85){trend='falling';trendLabel='↘ 下降';}}
     const label=norm>0.6?'热门集中':norm<0.35?'冷门分散':'中性';
     const color=norm>0.6?'text-red-500':norm<0.35?'text-emerald-600':'text-amber-500';
     return{norm,avg,label,trend,trendLabel,color};
   },[sorted]);
 
-  // 四象限判断
   const quadrant=useMemo(()=>{
-    const highPool=poolStatus.score>=0.5;
-    const hot=crowdSignal.norm>=0.5;
-    if(highPool&&!hot) return{q:'Q1',emoji:'⚡',label:'最佳出击',
-      desc:'奖池积累+冷门格局，分奖人少，高性价比',
-      strategy:'dangtuo',budgetMult:2.0,
-      color:'text-emerald-700',bg:'bg-emerald-50',border:'border-emerald-300'};
-    if(highPool&&hot) return{q:'Q2',emoji:'⚠️',label:'谨慎参与',
-      desc:'奖池高但选号集中，中奖后分奖人多，收益打折',
-      strategy:'compound',budgetMult:0.5,
-      color:'text-amber-700',bg:'bg-amber-50',border:'border-amber-300'};
-    if(!highPool&&!hot) return{q:'Q3',emoji:'🎯',label:'轻仓守候',
-      desc:'普通奖期+冷门格局，中奖分奖少，单式保守参与',
-      strategy:'single',budgetMult:1.0,
-      color:'text-blue-700',bg:'bg-blue-50',border:'border-blue-300'};
-    return{q:'Q4',emoji:'🚫',label:'最小参与',
-      desc:'普通奖期+热门集中，最差组合，建议跳过或最小投入',
-      strategy:'skip',budgetMult:0.25,
-      color:'text-slate-500',bg:'bg-slate-50',border:'border-slate-300'};
+    const highPool=poolStatus.score>=0.5,hot=crowdSignal.norm>=0.5;
+    if(highPool&&!hot)return{q:'Q1',emoji:'⚡',label:'最佳出击',desc:'奖池积累+冷门格局，分奖人少，高性价比',strategy:'dangtuo',budgetMult:2.0,color:'text-emerald-700',bg:'bg-emerald-50',border:'border-emerald-300'};
+    if(highPool&&hot)return{q:'Q2',emoji:'⚠️',label:'谨慎参与',desc:'奖池高但选号集中，中奖后分奖人多，收益打折',strategy:'compound',budgetMult:0.5,color:'text-amber-700',bg:'bg-amber-50',border:'border-amber-300'};
+    if(!highPool&&!hot)return{q:'Q3',emoji:'🎯',label:'轻仓守候',desc:'普通奖期+冷门格局，中奖分奖少，单式保守参与',strategy:'single',budgetMult:1.0,color:'text-blue-700',bg:'bg-blue-50',border:'border-blue-300'};
+    return{q:'Q4',emoji:'🚫',label:'最小参与',desc:'普通奖期+热门集中，最差组合，建议跳过或最小投入',strategy:'skip',budgetMult:0.25,color:'text-slate-500',bg:'bg-slate-50',border:'border-slate-300'};
   },[poolStatus,crowdSignal]);
 
-  // 生成投注方案
+  const saveApiKey=(key)=>{setApiKey(key);try{localStorage.setItem('ssq_gemini_key',key);}catch(e){}};
+
+  // ── 构建完整Prompt ──────────────────────────────────
+  const buildAiPrompt=useCallback(()=>{
+    const jp=latest&&latest.jackpot?(latest.jackpot/1e8).toFixed(2)+'亿':'未知';
+    const sales=latest&&latest.sales?(latest.sales/1e8).toFixed(2)+'亿':'未知';
+    const issueNo=latest&&latest.issue?latest.issue:'未知';
+    const nextIssue=latest&&latest.issue?(parseInt(latest.issue)+1).toString():'下一期';
+
+    // 近10期开奖
+    const recent10=sorted.slice(-10).map(d=>`期号${d.issue}: 红[${[d.red1,d.red2,d.red3,d.red4,d.red5,d.red6].join(',')}]+蓝${d.blue} 奖池¥${d.jackpot?(d.jackpot/1e8).toFixed(1)+'亿':'N/A'} 销售额¥${d.sales?(d.sales/1e8).toFixed(1)+'亿':'N/A'}`).join('\n');
+
+    // 近50期热冷号
+    const recent50=sorted.slice(-50);
+    const redFreq=new Array(33).fill(0);
+    recent50.forEach(d=>[d.red1,d.red2,d.red3,d.red4,d.red5,d.red6].forEach(r=>{if(r>=1&&r<=33)redFreq[r-1]++;}));
+    const redRanked=redFreq.map((c,i)=>({n:i+1,c})).sort((a,b)=>b.c-a.c);
+    const hotReds=redRanked.slice(0,8).map(x=>`${x.n}(${x.c}次)`).join(' ');
+    const coldReds=redRanked.slice(-8).reverse().map(x=>`${x.n}(${x.c}次)`).join(' ');
+    const blueFreq=new Array(16).fill(0);
+    recent50.forEach(d=>{if(d.blue>=1&&d.blue<=16)blueFreq[d.blue-1]++;});
+    const hotBlue=blueFreq.map((c,i)=>({n:i+1,c})).sort((a,b)=>b.c-a.c).slice(0,5).map(x=>`${x.n}(${x.c}次)`).join(' ');
+    const coldBlue=blueFreq.map((c,i)=>({n:i+1,c})).sort((a,b)=>a.c-b.c).slice(0,5).map(x=>`${x.n}(${x.c}次)`).join(' ');
+
+    // 近50期和值/跨度统计
+    const sums=recent50.map(d=>[d.red1,d.red2,d.red3,d.red4,d.red5,d.red6].reduce((s,v)=>s+v,0));
+    const avgSum=(sums.reduce((s,v)=>s+v,0)/sums.length).toFixed(1);
+    const spans=recent50.map(d=>Math.max(d.red1,d.red2,d.red3,d.red4,d.red5,d.red6)-Math.min(d.red1,d.red2,d.red3,d.red4,d.red5,d.red6));
+    const avgSpan=(spans.reduce((s,v)=>s+v,0)/spans.length).toFixed(1);
+
+    // 模型推理
+    let modelSection='【LSTM模型推理】未运行，无概率数据。';
+    if(inferenceResult){
+      const top8=inferenceResult.redProbs.map((p,i)=>({n:i+1,p})).sort((a,b)=>b.p-a.p).slice(0,8).map(x=>`${x.n}(${(x.p*100).toFixed(1)}%)`).join(' ');
+      const topBlue=inferenceResult.blueProbs.map((p,i)=>({n:i+1,p})).sort((a,b)=>b.p-a.p).slice(0,4).map(x=>`${x.n}(${(x.p*100).toFixed(1)}%)`).join(' ');
+      const mv=inferenceResult.variance;
+      const danCands=inferenceResult.redProbs.map((p,i)=>({n:i+1,p,conf:p*(1-Math.min((mv?mv[i]||0:0)*20,1))})).sort((a,b)=>b.conf-a.conf).slice(0,3);
+      modelSection=`【LSTM模型推理结果】
+红球概率Top8: ${top8}
+蓝球概率Top4: ${topBlue}
+模型置信胆码候选(高概率×低方差): ${danCands.map(x=>`${x.n}(置信${(x.conf*100).toFixed(1)}%)`).join(' ')}
+预测不确定度: ${inferenceResult.uncertaintyRed?inferenceResult.uncertaintyRed.toFixed(4):'N/A'} (越低越可信)
+风险等级: ${inferenceResult.riskLevel||'medium'}`;
+    }
+
+    // 回测数据
+    let btSection='【历史回测】尚未执行回测。';
+    if(btSum){
+      btSection=`【最近一次历史回测】
+模型: ${btSum.modelType||'lstm'} | 投注模式: ${btSum.betMode} | 测试期数: ${btSum.totalIssues}期
+ROI: ${btSum.returnOnInvestment?btSum.returnOnInvestment.toFixed(2):'N/A'}% | 实际RTP: ${btSum.officialRTP?btSum.officialRTP.toFixed(1):'N/A'}% (官方基准50%)
+中奖率: ${btSum.winRate?btSum.winRate.toFixed(2):'N/A'}% | 最大回撤: ${btSum.maxDrawdown?btSum.maxDrawdown.toFixed(1):'N/A'}%
+模型超额优势: RTP+${btSum.edgeRTP?btSum.edgeRTP.toFixed(1):'N/A'}pp | 中奖率+${btSum.edgeWinRate?btSum.edgeWinRate.toFixed(1):'N/A'}pp
+奖级分布: 一等奖${btSum.levelCounts&&btSum.levelCounts['1st']||0}次 | 二等奖${btSum.levelCounts&&btSum.levelCounts['2nd']||0}次 | 三等奖${btSum.levelCounts&&btSum.levelCounts['3rd']||0}次 | 四等奖${btSum.levelCounts&&btSum.levelCounts['4th']||0}次`;
+    }
+    let histBtSection='';
+    if(btHistory.length>0){
+      const recent5=btHistory.slice(0,5);
+      histBtSection=`\n【历史回测趋势（最近${recent5.length}次）】\n`+recent5.map((r,i)=>`[${i+1}] ${r.time.slice(5,16)} ${r.modelType} ${r.betMode} ROI=${r.roi}% RTP=${r.rtp}% 中奖率=${r.winRate}% 最大回撤=${r.maxDrawdown}% 最终余额¥${r.finalBalance.toLocaleString()}`).join('\n');
+      const rtps=btHistory.slice(0,Math.min(10,btHistory.length)).map(r=>+r.rtp);
+      const avgRtp=(rtps.reduce((s,v)=>s+v,0)/rtps.length).toFixed(1);
+      const rois=btHistory.slice(0,Math.min(10,btHistory.length)).map(r=>+r.roi);
+      const avgRoi=(rois.reduce((s,v)=>s+v,0)/rois.length).toFixed(1);
+      histBtSection+=`\n近${rtps.length}次回测均值: RTP=${avgRtp}% ROI=${avgRoi}%`;
+    }
+
+    return `你是全球顶级彩票量化分析师，拥有20年双色球专项数据研究经验，深度精通概率论、行为金融学、博弈论与风险管理。你的分析风格：数据驱动、逻辑严谨、结论明确可操作，从不含糊。
+
+═══════════════════════════════════════════════
+【双色球官方规则（内置参考）】
+═══════════════════════════════════════════════
+玩法: 从1-33中选6个红球 + 从1-16中选1个蓝球
+奖级及中奖条件（红球命中数+蓝球命中数）:
+  一等奖: 6红+1蓝 → 奖池全额（浮动，通常500万至数亿）
+  二等奖: 6红+0蓝 → 固定奖金区参与分配
+  三等奖: 5红+1蓝 → ¥3,000（固定）
+  四等奖: 5红+0蓝 或 4红+1蓝 → ¥200（固定）
+  五等奖: 4红+0蓝 或 3红+1蓝 → ¥10（固定）
+  六等奖: 2红+1蓝 或 1红+1蓝 或 0红+1蓝 → ¥5（固定）
+单注售价: ¥2元
+理论返奖率(RTP): 约50%（官方规定）
+总组合数: C(33,6)×16 = 17,721,088种
+一等奖概率: 1/17,721,088 ≈ 5.64×10⁻⁸
+奖池机制: 一等奖无人中时累积滚存，超过5亿元启动调节机制
+投注方式: 单式(2元/注)、复式(多红/蓝组合)、胆拖(部分号码保障)
+每周开奖: 周二、周四、周日（每周3次）
+
+═══════════════════════════════════════════════
+【当前市场状态（期号${issueNo}，分析目标：${nextIssue}期）】
+═══════════════════════════════════════════════
+当前奖池金额: ${jp}
+当前期销售额: ${sales}
+连续未开一等奖期数: ${streakDepth}期
+奖池状态评级: ${poolStatus.label}
+近10期选号拥挤度: ${crowdSignal.label} 趋势${crowdSignal.trendLabel}
+博弈象限判定: ${quadrant.q} [${quadrant.label}] — ${quadrant.desc}
+预算系数建议: ×${quadrant.budgetMult}
+
+═══════════════════════════════════════════════
+【近10期开奖记录】
+═══════════════════════════════════════════════
+${recent10}
+
+═══════════════════════════════════════════════
+【近50期统计特征】
+═══════════════════════════════════════════════
+热号Top8(出现频次): ${hotReds}
+冷号Bottom8(出现频次): ${coldReds}
+热蓝Top5: ${hotBlue}
+冷蓝Bottom5: ${coldBlue}
+近50期红球和值均值: ${avgSum}（理论均值约102）
+近50期红球最大跨度均值: ${avgSpan}（理论均值约27）
+
+═══════════════════════════════════════════════
+${modelSection}
+
+═══════════════════════════════════════════════
+${btSection}
+${histBtSection}
+
+═══════════════════════════════════════════════
+
+请严格按照以下格式输出完整分析报告（中文，专业简洁）：
+
+---
+# 双色球${nextIssue}期 量化研判报告
+
+## 一、市场博弈环境研判
+[分析奖池积累程度、拥挤度信号含义、历史同类情形下的规律，100字以内]
+
+## 二、数据信号综合解读
+[结合热冷号统计、和值跨度规律、LSTM概率分布，识别本期关键信号，150字以内]
+
+## 三、历史回测绩效评估
+[从多次回测ROI/RTP趋势、最大回撤、中奖率，评估模型综合评级：优/良/一般/差，说明理由，100字以内]
+
+## 四、💡 本期操作结论（重点）
+**参与建议**：[明确写：强烈参与 / 正常参与 / 谨慎参与 / 建议跳过]
+**推荐投注模式**：[胆拖/复式/单式，说明理由]
+**核心选号方案**：
+- 胆码红球（最高置信度，必选）：[列出2-3个号码]
+- 拖码/扩展红球（次优选择）：[列出4-8个号码]
+- 蓝球推荐：[列出1-2个号码]
+**本期建议投入金额**：[具体金额，考虑预算基准¥${baseBudget}，结合象限系数]
+**预期命中层级**：[基于回测数据，最可能命中的奖级]
+**风险提示**：[一句话，简洁]
+
+## 五、💰 资金管理建议（彩民视角）
+**单期投入上限**：[建议不超过可支配娱乐预算的X%，具体金额参考]
+**回本周期估算**：[基于回测RTP和中奖率，理论上需投注N期才能覆盖成本]
+**资金回收平衡点**：[累计投入达到Y元时，统计上期望已回收Z元（RTP×Y），亏损风险区间]
+**止损建议**：[连续亏损超过N期或累计亏损超过X元时，建议停止本轮]
+**娱乐化定位**：[一句话提醒：彩票本质是娱乐消费，期望值为负，理性参与]
+
+## 六、下期重点观察指标
+[列出3个具体数据阈值，如奖池超过X亿、销售额变化、拥挤度方向]
+---`;
+  },[sorted,latest,streakDepth,poolStatus,crowdSignal,quadrant,inferenceResult,btSum,btHistory,baseBudget]);
+
+  // ── 保存AI报告记录 ────────────────────────────────────
+  const saveAiReport=(text)=>{
+    const rec={
+      id:Date.now(),
+      time:new Date().toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}),
+      issue:latest&&latest.issue?latest.issue:'未知',
+      jackpot:latest&&latest.jackpot?(latest.jackpot/1e8).toFixed(2)+'亿':'N/A',
+      quadrant:quadrant.q+' '+quadrant.label,
+      content:text,
+      starred:false,
+      note:''
+    };
+    const updated=[rec,...aiHistory].slice(0,50);
+    setAiHistory(updated);
+    try{localStorage.setItem('ssq_ai_history',JSON.stringify(updated));}catch(e){}
+    return rec.id;
+  };
+
+  const toggleAiStar=(id)=>{
+    const updated=aiHistory.map(r=>r.id===id?{...r,starred:!r.starred}:r);
+    setAiHistory(updated);
+    try{localStorage.setItem('ssq_ai_history',JSON.stringify(updated));}catch(e){}
+  };
+  const updateAiNote=(id,note)=>{
+    const updated=aiHistory.map(r=>r.id===id?{...r,note}:r);
+    setAiHistory(updated);
+    try{localStorage.setItem('ssq_ai_history',JSON.stringify(updated));}catch(e){}
+  };
+  const deleteAiRec=(id)=>{
+    const updated=aiHistory.filter(r=>r.id!==id);
+    setAiHistory(updated);
+    try{localStorage.setItem('ssq_ai_history',JSON.stringify(updated));}catch(e){}
+    setDeleteConfirm(null);
+    if(viewingReport===id)setViewingReport(null);
+  };
+
+  // ── 调用 Gemini API ───────────────────────────────────
+  const handleAiAnalysis=useCallback(async()=>{
+    const key=apiKey.trim();
+    if(!key){setShowKeyInput(true);setAiError('请先配置 Gemini API Key');return;}
+    setAiLoading(true);setAiError('');setAiReport(null);setViewingReport(null);
+    try{
+      const prompt=buildAiPrompt();
+      const resp=await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key='+encodeURIComponent(key),{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({contents:[{parts:[{text:prompt}]}],generationConfig:{maxOutputTokens:8192,temperature:0.6}})
+      });
+      const d=await resp.json();
+      if(d.error)throw new Error(d.error.message||'API错误(code:'+d.error.code+')');
+      const candidate=d.candidates?.[0];
+      const text=candidate?.content?.parts?.[0]?.text||'';
+      if(!text)throw new Error('Gemini返回内容为空，请检查Key是否有效');
+      // 检测是否被token限制截断
+      const finishReason=candidate?.finishReason||'';
+      const finalText=finishReason==='MAX_TOKENS'
+        ? text+'\n\n---\n⚠️ **注意：报告因Token上限被截断，内容不完整。请重新生成。**'
+        : text;
+      setAiReport(finalText);
+      saveAiReport(finalText);
+    }catch(e){
+      const msg=e.message||'未知错误';
+      if(msg.includes('Failed to fetch'))setAiError('网络请求失败：请用本地HTTP服务器打开文件（python3 -m http.server 8080），而非直接双击打开。');
+      else setAiError('AI分析失败: '+msg);
+    }finally{setAiLoading(false);}
+  },[buildAiPrompt,apiKey]);
+
+  // ── 导出报告为HTML ───────────────────────────────────
+  const exportReportHtml=(content,meta)=>{
+    // 完整可靠的 Markdown → HTML 转换（逐行解析）
+    const md2html=(text)=>{
+      const lines=text.split('\n');
+      const out=[];
+      let inList=false;
+      const escHtml=(s)=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+      const inlineReplace=(s)=>{
+        let r=escHtml(s);
+        r=r.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+        return r;
+      };
+      for(let i=0;i<lines.length;i++){
+        const line=lines[i];
+        if(line.startsWith('# ')){
+          if(inList){out.push('</ul>');inList=false;}
+          out.push('<h1>'+inlineReplace(line.slice(2))+'</h1>');
+        }else if(line.startsWith('## ')){
+          if(inList){out.push('</ul>');inList=false;}
+          out.push('<h2>'+inlineReplace(line.slice(3))+'</h2>');
+        }else if(line.startsWith('### ')){
+          if(inList){out.push('</ul>');inList=false;}
+          out.push('<h3>'+inlineReplace(line.slice(4))+'</h3>');
+        }else if(line.startsWith('- ')||line.startsWith('* ')){
+          if(!inList){out.push('<ul>');inList=true;}
+          out.push('<li>'+inlineReplace(line.slice(2))+'</li>');
+        }else if(line.trim()===''||line.trim().match(/^═+$/)){
+          if(inList){out.push('</ul>');inList=false;}
+          out.push('');
+        }else if(line.trim()==='---'||line.trim()==='***'){
+          if(inList){out.push('</ul>');inList=false;}
+          out.push('<hr>');
+        }else{
+          if(inList){out.push('</ul>');inList=false;}
+          out.push('<p>'+inlineReplace(line)+'</p>');
+        }
+      }
+      if(inList)out.push('</ul>');
+      return out.join('\n');
+    };
+    const htmlContent=md2html(content);
+    // 本期操作结论 & 资金管理 加红色边框高亮
+    const highlighted=htmlContent.replace(
+      /(<h2>[^<]*(?:本期操作结论|资金管理建议)[^<]*<\/h2>)([\s\S]*?)(?=<h2>|$)/g,
+      (m,h2tag,body)=>'<div class="conclusion">'+h2tag+body+'</div>'
+    );
+    const blob=new Blob([`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>双色球研判报告 ${meta.issue}期</title>
+<style>
+body{font-family:'PingFang SC',sans-serif;max-width:860px;margin:0 auto;padding:32px;color:#1e293b;line-height:1.8}
+h1{font-size:22px;border-bottom:3px solid #4f46e5;padding-bottom:8px;color:#1e293b}
+h2{font-size:16px;color:#4f46e5;margin-top:24px;margin-bottom:8px;padding:6px 12px;background:#eef2ff;border-radius:6px}
+strong{color:#dc2626;font-weight:700}
+ul{padding-left:20px}li{margin:4px 0}
+hr{border:none;border-top:1px dashed #cbd5e1;margin:16px 0}
+p{margin:6px 0}
+.meta{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px 20px;margin-bottom:24px;font-size:13px;color:#64748b}
+.conclusion{border:2px solid #ef4444;border-radius:8px;padding:16px;margin:16px 0;background:#fff5f5}
+.footer{margin-top:40px;padding-top:16px;border-top:1px solid #e2e8f0;font-size:12px;color:#94a3b8;text-align:center}
+@media print{body{padding:16px}}
+</style></head><body>
+<div class="meta">
+  <strong>SSQ量化预测平台 · AI研判报告</strong> &nbsp;|&nbsp; 
+  分析期号：${meta.issue}期 &nbsp;|&nbsp; 
+  生成时间：${meta.time} &nbsp;|&nbsp; 
+  奖池：${meta.jackpot} &nbsp;|&nbsp; 
+  象限：${meta.quadrant}
+</div>
+${highlighted}
+<div class="footer">本报告由 Gemini 2.5 Flash 生成，仅供参考。彩票存在随机性，理性娱乐，量力而行。</div>
+</body></html>`],{type:'text/html;charset=utf-8'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;a.download=`SSQ研判报告_${meta.issue}期_${meta.time.replace(/[/:]/g,'-')}.html`;
+    document.body.appendChild(a);a.click();document.body.removeChild(a);
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  };
+
+  // ── Markdown渲染（带结论红色高亮）────────────────────
+  const renderReport=(text)=>{
+    if(!text)return null;
+    const lines=text.split('\n');
+    let inConclusion=false;
+    const elements=[];
+    lines.forEach((line,i)=>{
+      if(!line.trim()){elements.push(h('div',{key:i,className:'h-1'}));return;}
+      // H1标题
+      if(line.startsWith('# ')){
+        elements.push(h('h1',{key:i,className:'text-lg font-bold text-slate-900 border-b-2 border-indigo-500 pb-2 mb-4 mt-2'},line.slice(2)));return;
+      }
+      // H2标题 — 检测是否是结论板块
+      if(line.startsWith('## ')){
+        inConclusion=line.includes('本期操作结论')||line.includes('资金管理');
+        const titleText=line.slice(3);
+        elements.push(h('div',{key:i,className:'mt-5 mb-2 px-3 py-1.5 rounded-lg font-bold text-sm '+(inConclusion?'bg-red-50 text-red-700 border border-red-200':'bg-indigo-50 text-indigo-700')},titleText));
+        return;
+      }
+      // 分割线
+      if(line.trim()==='---'){elements.push(h('hr',{key:i,className:'border-dashed border-slate-200 my-3'}));inConclusion=false;return;}
+      // 列表项
+      if(line.startsWith('- ')){
+        elements.push(h('div',{key:i,className:'flex gap-2 text-sm ml-4 '+(inConclusion?'text-red-700':'text-slate-600')},
+          h('span',{className:'text-slate-400 flex-shrink-0'},'•'),
+          h('span',{},renderInline(line.slice(2),inConclusion))
+        ));return;
+      }
+      // 普通行
+      elements.push(h('div',{key:i,className:'text-sm leading-relaxed '+(inConclusion?'text-red-700 font-medium':'text-slate-600')},renderInline(line,inConclusion)));
+    });
+    return elements;
+  };
+
+  const renderInline=(text,isRed)=>{
+    const parts=text.split(/\*\*([^*]+)\*\*/);
+    return parts.map((p,j)=>j%2===1
+      ?h('strong',{key:j,className:isRed?'text-red-700 font-bold':'text-slate-900 font-bold'},p)
+      :p
+    );
+  };
+
   const handleGenerate=useCallback(()=>{
     setComputing(true);
     setTimeout(()=>{
@@ -3790,98 +4933,69 @@ function DecisionLab({data, activeModel, inferenceResult, btSum, btRecs}){
         const bp=inferenceResult?inferenceResult.blueProbs:Array(16).fill(1/16);
         const redRanked=[...rp.map((p,i)=>({n:i+1,p}))].sort((a,b)=>b.p-a.p);
         const blueRanked=[...bp.map((p,i)=>({n:i+1,p}))].sort((a,b)=>b.p-a.p);
-        // 胆码：高概率低方差
         const mv=inferenceResult&&Array.isArray(inferenceResult.variance)?inferenceResult.variance:null;
-        const danReds=[...redRanked].map((x,i)=>({...x,conf:x.p*(1-Math.min((mv?mv[i]||0:0)*20,1))}))
-          .sort((a,b)=>b.conf-a.conf).slice(0,2).map(x=>x.n).sort((a,b)=>a-b);
+        const danReds=[...redRanked].map((x,i)=>({...x,conf:x.p*(1-Math.min((mv?mv[i]||0:0)*20,1))})).sort((a,b)=>b.conf-a.conf).slice(0,2).map(x=>x.n).sort((a,b)=>a-b);
         const tuoPool=redRanked.filter(r=>!danReds.includes(r.n));
         const tuoReds=tuoPool.slice(0,8).map(r=>r.n).sort((a,b)=>a-b);
-        const blue1=blueRanked[0].n; const blue2=blueRanked[1].n;
-        // 胆拖注数：C(拖码数, 6-胆码数)
-        const danN=danReds.length; const tuoN=tuoReds.length;
+        const blue1=blueRanked[0].n,blue2=blueRanked[1].n;
+        const danN=danReds.length,tuoN=tuoReds.length;
         const notesDT=comb(tuoN,6-danN);
-        // 复式注数：C(7,6)=7
         const top7=redRanked.slice(0,7).map(r=>r.n).sort((a,b)=>a-b);
         const plans=[];
-        // Q1: 胆拖方案
-        plans.push({type:'dangtuo',label:`${danN}胆${tuoN}拖×单蓝`,
-          danReds,tuoReds,blue:[blue1],notes:notesDT,cost:notesDT*2,
-          tip:`胆码=[${danReds.join('·')}] 模型最高置信度，拖码Top-${tuoN}概率`});
-        if(budget>=notesDT*4) plans.push({type:'dangtuo2',label:`${danN}胆${tuoN}拖×双蓝`,
-          danReds,tuoReds,blue:[blue1,blue2],notes:notesDT*2,cost:notesDT*4,
-          tip:'双蓝覆盖，一/二等奖命中率×2，成本×2'});
-        // Q2/Q3: 复式方案
-        plans.push({type:'compound',label:'Top-7红复式×单蓝',
-          reds:top7,blue:[blue1],notes:7,cost:14,
-          tip:`模型概率前7红球，C(7,6)=7注`});
-        // 单式保底
+        plans.push({type:'dangtuo',label:`${danN}胆${tuoN}拖×单蓝`,danReds,tuoReds,blue:[blue1],notes:notesDT,cost:notesDT*2,tip:`胆码=[${danReds.join('·')}] 高置信度，拖码Top-${tuoN}`});
+        if(budget>=notesDT*4)plans.push({type:'dangtuo2',label:`${danN}胆${tuoN}拖×双蓝`,danReds,tuoReds,blue:[blue1,blue2],notes:notesDT*2,cost:notesDT*4,tip:'双蓝覆盖，命中概率×2，成本×2'});
+        plans.push({type:'compound',label:'Top-7红复式×单蓝',reds:top7,blue:[blue1],notes:7,cost:14,tip:'C(7,6)=7注，系统化覆盖'});
         const single=redRanked.slice(0,6).map(r=>r.n).sort((a,b)=>a-b);
-        plans.push({type:'single',label:'单式×单蓝',
-          reds:single,blue:[blue1],notes:1,cost:2,tip:'最低成本维持参与'});
-        // 按象限筛选推荐
-        const recType=quadrant.strategy==='dangtuo'?['dangtuo','dangtuo2']:
-                       quadrant.strategy==='compound'?['compound']:
-                       quadrant.strategy==='single'?['single']:['single'];
-        setPlan({quadrant,poolStatus,crowdSignal,budget,plans,recType,
-                 hasModel:!!inferenceResult,ts:new Date().toLocaleTimeString()});
+        plans.push({type:'single',label:'单式×单蓝',reds:single,blue:[blue1],notes:1,cost:2,tip:'最低成本维持参与'});
+        const recType=quadrant.strategy==='dangtuo'?['dangtuo','dangtuo2']:quadrant.strategy==='compound'?['compound']:['single'];
+        setPlan({quadrant,poolStatus,crowdSignal,budget,plans,recType,hasModel:!!inferenceResult,ts:new Date().toLocaleTimeString()});
       }catch(e){alert('生成失败: '+e.message);}
       setComputing(false);
     },200);
   },[baseBudget,quadrant,poolStatus,crowdSignal,inferenceResult]);
 
-  // 历史分布（点击后异步计算，避免卡死）
   const handleShowHist=useCallback(()=>{
     if(showHist){setShowHist(false);return;}
     setShowHist(true);
-    if(histData) return;
+    if(histData)return;
     setTimeout(()=>{
       try{
-        const TOTAL=17721088; const maxC=20;
-        const stats={Q1:0,Q2:0,Q3:0,Q4:0};
-        let streak=0;
+        const TOTAL=17721088,stats={Q1:0,Q2:0,Q3:0,Q4:0};let streak=0;
         sorted.forEach((d,i)=>{
-          if(i<10) return;
+          if(i<10)return;
           const recent=sorted.slice(i-10,i);
-          const ratios=recent.map(r=>{
-            const sl=r.sales||0;const p1=r.prize1Count;
-            if(sl<=0||p1==null) return null;
-            const ew=(sl/2)/TOTAL; return ew>0.05?p1/ew:null;
-          }).filter(x=>x!=null);
+          const ratios=recent.map(r=>{const sl=r.sales||0,p1=r.prize1Count;if(sl<=0||p1==null)return null;const ew=(sl/2)/TOTAL;return ew>0.05?p1/ew:null;}).filter(x=>x!=null);
           const avg=ratios.length>0?ratios.reduce((s,v)=>s+v,0)/ratios.length:10;
-          const norm=Math.min(avg/maxC,1);
-          const jp=d.jackpot||0;
-          const highPool=(jp>3e8||streak>=1);
-          const hot=(norm>=0.5);
+          const norm=Math.min(avg/20,1),jp=d.jackpot||0,highPool=(jp>3e8||streak>=1),hot=(norm>=0.5);
           const q=highPool&&!hot?'Q1':highPool&&hot?'Q2':!highPool&&!hot?'Q3':'Q4';
           stats[q]++;
-          if(d.prize1Count!=null) streak=d.prize1Count>0?0:streak+1;
+          if(d.prize1Count!=null)streak=d.prize1Count>0?0:streak+1;
         });
         const total=Object.values(stats).reduce((s,v)=>s+v,0)||1;
-        setHistData({stats,total,pct:{
-          Q1:(stats.Q1/total*100).toFixed(1),Q2:(stats.Q2/total*100).toFixed(1),
-          Q3:(stats.Q3/total*100).toFixed(1),Q4:(stats.Q4/total*100).toFixed(1)}});
+        setHistData({stats,total,pct:{Q1:(stats.Q1/total*100).toFixed(1),Q2:(stats.Q2/total*100).toFixed(1),Q3:(stats.Q3/total*100).toFixed(1),Q4:(stats.Q4/total*100).toFixed(1)}});
       }catch(e){console.error(e);}
     },50);
   },[sorted,showHist,histData]);
 
   const noData=data.length===0;
   const latestJP=latest&&latest.jackpot?`¥${(latest.jackpot/1e8).toFixed(2)}亿`:'暂无';
+  const currentReport=viewingReport!=null?aiHistory.find(r=>r.id===viewingReport):null;
+  const displayReport=currentReport?currentReport.content:aiReport;
+  const displayMeta=currentReport||{issue:latest&&latest.issue,time:new Date().toLocaleString(),jackpot:latestJP,quadrant:quadrant.q+' '+quadrant.label};
 
   return h('div',{className:'space-y-4'},
-    // ── 状态栏 4格 ──────────────────────────────────────
+
+    // ── 顶部状态栏 ──
     h('div',{className:'grid grid-cols-2 md:grid-cols-4 gap-3'},
       h('div',{className:'bg-white rounded-xl border border-slate-200 p-4'},
         h('div',{className:'text-xs text-slate-400 mb-1'},'数据状态'),
-        h('div',{className:'text-sm font-bold '+(noData?'text-red-500':'text-emerald-600')},
-          noData?'⚠ 未加载':'✅ '+data.length+'期'),
+        h('div',{className:'text-sm font-bold '+(noData?'text-red-500':'text-emerald-600')},noData?'⚠ 未加载':'✅ '+data.length+'期'),
         h('div',{className:'text-xs text-slate-400 mt-0.5'},latest?latest.date:'请先加载CSV')
       ),
       h('div',{className:'bg-white rounded-xl border border-slate-200 p-4'},
         h('div',{className:'text-xs text-slate-400 mb-1'},'推理状态'),
-        h('div',{className:'text-sm font-bold '+(inferenceResult?'text-emerald-600':'text-amber-500')},
-          inferenceResult?'✅ 已推理':'⚠ 未推理'),
-        h('div',{className:'text-xs text-slate-400 mt-0.5'},
-          inferenceResult?'概率分布就绪':'请在模型实验运行推理')
+        h('div',{className:'text-sm font-bold '+(inferenceResult?'text-emerald-600':'text-amber-500')},inferenceResult?'✅ 已推理':'⚠ 未推理'),
+        h('div',{className:'text-xs text-slate-400 mt-0.5'},inferenceResult?'概率分布就绪':'请在模型实验运行推理')
       ),
       h('div',{className:'bg-white rounded-xl border '+poolStatus.border+' p-4'},
         h('div',{className:'text-xs text-slate-400 mb-1'},'当前奖池'),
@@ -3889,78 +5003,208 @@ function DecisionLab({data, activeModel, inferenceResult, btSum, btRecs}){
         h('div',{className:'text-xs text-slate-400 mt-0.5'},latestJP+' · 积累'+streakDepth+'期')
       ),
       h('div',{className:'bg-white rounded-xl border border-slate-200 p-4'},
-        h('div',{className:'text-xs text-slate-400 mb-1'},'近10期拥挤度'),
-        h('div',{className:'text-sm font-bold '+crowdSignal.color},crowdSignal.label),
-        h('div',{className:'text-xs text-slate-400 mt-0.5'},crowdSignal.trendLabel||'数据不足')
+        h('div',{className:'text-xs text-slate-400 mb-1'},'AI报告记录'),
+        h('div',{className:'text-sm font-bold '+(aiHistory.length>0?'text-indigo-600':'text-slate-400')},aiHistory.length>0?'📋 '+aiHistory.length+'条':'暂无记录'),
+        h('div',{className:'text-xs text-slate-400 mt-0.5'},aiHistory.length>0?'最新: '+aiHistory[0].time:'生成后自动保存')
       )
     ),
 
-    // ── 四象限矩阵 ──────────────────────────────────────
+    // ── AI 综合研判主面板 ──
+    h('div',{className:'bg-white rounded-xl border border-slate-200 shadow-sm'},
+      // 标题栏
+      h('div',{className:'px-6 py-4 border-b bg-gradient-to-r from-indigo-900 to-slate-800 flex items-center justify-between'},
+        h('div',{},
+          h('div',{className:'font-bold text-white text-sm flex items-center gap-2'},h('span',{style:{fontSize:18}},'🧠'),'顶级博彩大师 · AI综合研判'),
+          h('div',{className:'text-xs text-indigo-300 mt-0.5'},'整合：历史数据 · LSTM推理 · 历史回测 · 博弈信号 → 由 Gemini 2.5 Flash 生成专业决策报告')
+        ),
+        h('div',{className:'flex items-center gap-2'},
+          h('button',{onClick:()=>setShowKeyInput(v=>!v),title:'配置 Gemini API Key',
+            className:'w-9 h-9 rounded-xl flex items-center justify-center text-base transition-all '+(apiKey?'bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30':'bg-white/10 text-white/60 hover:bg-white/20')},apiKey?'🔑':'🔐'),
+          h('button',{onClick:handleAiAnalysis,disabled:aiLoading||noData,
+            className:'px-5 py-2.5 rounded-xl text-sm font-bold transition-all shadow '+(aiLoading||noData?'bg-slate-600 text-slate-400 cursor-not-allowed':'bg-indigo-500 text-white hover:bg-indigo-400 active:scale-95')},
+            aiLoading?'🔄 分析中…':'⚡ 生成AI研判报告')
+        )
+      ),
+
+      // Key 输入面板
+      showKeyInput&&h('div',{className:'px-6 py-4 border-b bg-slate-900/50'},
+        h('div',{className:'text-xs text-indigo-300 mb-2 font-bold'},'🔑 Gemini API Key 配置'),
+        h('div',{className:'text-xs text-slate-400 mb-3 leading-relaxed'},
+          'Key 仅保存在本地浏览器（localStorage），不会上传任何服务器。',
+          h('br',{}),'获取：',
+          h('a',{href:'https://aistudio.google.com/app/apikey',target:'_blank',className:'text-indigo-400 underline'},'aistudio.google.com/apikey'),
+          ' → Create API Key → 复制粘贴。'
+        ),
+        h('div',{className:'flex gap-2'},
+          h('input',{type:'password',value:apiKey,onChange:e=>setApiKey(e.target.value),
+            onKeyDown:e=>{if(e.key==='Enter'){saveApiKey(apiKey);setShowKeyInput(false);}},
+            placeholder:'AIzaSy-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…',
+            className:'flex-1 bg-slate-800 border border-slate-600 text-white text-xs rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-400 placeholder-slate-500 font-mono'}),
+          h('button',{onClick:()=>{saveApiKey(apiKey);setShowKeyInput(false);setAiError('');},className:'px-4 py-2 bg-indigo-600 text-white text-xs font-bold rounded-lg hover:bg-indigo-500'},'保存'),
+          apiKey&&h('button',{onClick:()=>{saveApiKey('');setAiError('');},className:'px-3 py-2 bg-red-900/40 text-red-400 text-xs rounded-lg hover:bg-red-900/60'},'清除')
+        ),
+        apiKey&&h('div',{className:'mt-2 text-xs text-emerald-400'},'✓ Key 已配置（'+apiKey.slice(0,12)+'…）')
+      ),
+
+      // 数据源指示条
+      h('div',{className:'px-6 py-2.5 bg-slate-50 border-b flex flex-wrap gap-4 text-xs text-slate-500'},
+        h('span',{className:(data.length>0?'text-emerald-600':'text-slate-300')+' font-medium'},(data.length>0?'✓':'○')+' 历史数据 '+data.length+'期'),
+        h('span',{className:(inferenceResult?'text-emerald-600':'text-slate-300')+' font-medium'},(inferenceResult?'✓':'○')+' LSTM推理'),
+        h('span',{className:(btSum?'text-emerald-600':'text-slate-300')+' font-medium'},(btSum?'✓':'○')+' 最近回测'),
+        h('span',{className:(btHistory.length>0?'text-emerald-600':'text-slate-300')+' font-medium'},(btHistory.length>0?'✓':'○')+' 回测历史 '+btHistory.length+'条'),
+        h('span',{className:'text-indigo-500 font-medium'},'+ 实时博弈信号'),
+        viewingReport!=null&&h('span',{className:'ml-auto text-amber-600 font-bold'},'📖 查看历史报告 #'+currentReport?.issue+'期')
+      ),
+
+      // 报告正文区（可滚动，足够高）
+      h('div',{className:'px-6 py-5',style:{maxHeight:'600px',minHeight:'120px',overflowY:'auto'}},
+        aiLoading&&h('div',{className:'flex flex-col items-center justify-center py-12 gap-3'},
+          h('div',{className:'text-4xl animate-spin'},'🔄'),
+          h('div',{className:'text-sm text-slate-500'},'正在整合所有数据，生成专业分析报告…'),
+          h('div',{className:'text-xs text-slate-400'},'通常需要15-30秒')
+        ),
+        aiError&&h('div',{className:'bg-red-50 border border-red-200 rounded-lg p-4 text-sm'},
+          h('div',{className:'font-bold text-red-600 mb-1'},'⚠ 分析失败'),
+          h('div',{className:'text-red-600'},aiError),
+          h('button',{onClick:()=>setShowKeyInput(true),className:'mt-2 text-xs underline text-red-400 hover:text-red-600'},'检查API Key配置')
+        ),
+        displayReport&&!aiLoading&&h('div',{},
+          h('div',{className:'flex items-center justify-between mb-3'},
+            h('div',{className:'flex items-center gap-2'},
+              h('span',{className:'text-xs bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full font-bold'},'AI研判报告'),
+              h('span',{className:'text-xs text-slate-400'},displayMeta.issue?'第'+displayMeta.issue+'期':''),
+              h('span',{className:'text-xs text-slate-400'},displayMeta.time)
+            ),
+            h('div',{className:'flex items-center gap-2'},
+              viewingReport!=null&&h('button',{
+                onClick:()=>setViewingReport(null),
+                className:'text-xs px-2 py-1 bg-slate-100 text-slate-600 rounded hover:bg-slate-200'
+              },'← 返回当前'),
+              h('button',{
+                onClick:()=>exportReportHtml(displayReport,displayMeta),
+                className:'text-xs px-3 py-1.5 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 font-medium'
+              },'💾 保存HTML')
+            )
+          ),
+          renderReport(displayReport)
+        ),
+        !aiLoading&&!displayReport&&!aiError&&h('div',{className:'flex flex-col items-center justify-center py-12 text-slate-400 gap-2'},
+          h('div',{style:{fontSize:40}},'🎯'),
+          h('div',{className:'text-sm font-medium'},'点击右上角按钮生成AI综合研判报告'),
+          h('div',{className:'text-xs text-center max-w-sm'},'将整合：'+data.length+'期历史数据 · '+(inferenceResult?'LSTM概率':'未推理')+' · '+(btHistory.length>0?btHistory.length+'条回测历史':'无回测记录')+' · 双色球完整规则 · 实时博弈信号')
+        )
+      )
+    ),
+
+    // ── AI 报告历史记录 ──
+    h('div',{className:'bg-white rounded-xl border border-slate-200 shadow-sm'},
+      h('div',{className:'px-5 py-3 border-b bg-slate-50 flex items-center justify-between'},
+        h('div',{className:'flex items-center gap-2'},
+          h('span',{className:'font-bold text-slate-700 text-sm'},'📋 AI研判历史记录'),
+          h('span',{className:'text-xs bg-indigo-100 text-indigo-600 px-1.5 py-0.5 rounded-full font-bold'},aiHistory.length+'/50条')
+        ),
+        h('div',{className:'flex items-center gap-2'},
+          h('span',{className:'text-xs text-slate-400'},'点击查看全文 · 可标记 · 可备注 · 可删除')
+        )
+      ),
+      aiHistory.length===0
+        ?h('div',{className:'px-6 py-10 text-center text-slate-400'},
+            h('div',{style:{fontSize:36}},'📭'),
+            h('p',{className:'mt-2 text-sm'},'暂无AI研判记录'),
+            h('p',{className:'text-xs mt-1'},'生成报告后自动保存')
+          )
+        :h('div',{className:'divide-y divide-slate-100'},
+            ...aiHistory.map(r=>{
+              const isViewing=viewingReport===r.id;
+              return h('div',{key:r.id,className:'px-5 py-3 hover:bg-slate-50 transition-colors '+(isViewing?'bg-indigo-50 border-l-2 border-indigo-400':'border-l-2 border-transparent')},
+                h('div',{className:'flex items-start gap-3'},
+                  h('button',{onClick:()=>toggleAiStar(r.id),className:'text-lg flex-shrink-0 mt-0.5 hover:scale-110 transition-transform',title:'标记重点'},r.starred?'★':'☆'),
+                  h('div',{className:'flex-1 min-w-0'},
+                    h('div',{className:'flex items-center gap-2 flex-wrap mb-1'},
+                      h('span',{className:'text-xs text-slate-400 font-mono'},r.time),
+                      h('span',{className:'text-xs font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700'},'第'+r.issue+'期'),
+                      h('span',{className:'text-xs px-1.5 py-0.5 rounded bg-slate-100 text-slate-500'},r.quadrant),
+                      h('span',{className:'text-xs text-slate-400'},'奖池'+r.jackpot),
+                      r.starred&&h('span',{className:'text-xs text-yellow-600 font-bold'},'★ 重点')
+                    ),
+                    // 报告预览（前80字）
+                    h('div',{className:'text-xs text-slate-400 truncate mb-1.5',style:{maxWidth:'500px'}},
+                      r.content.replace(/[#*\-=\n]/g,' ').replace(/\s+/g,' ').slice(0,80)+'…'
+                    ),
+                    h('div',{className:'flex items-center gap-2',onClick:e=>e.stopPropagation()},
+                      h('input',{type:'text',value:r.note||'',onChange:e=>updateAiNote(r.id,e.target.value),
+                        placeholder:'添加备注…',
+                        className:'text-xs text-slate-500 bg-transparent border-none outline-none placeholder-slate-300 hover:bg-slate-100 focus:bg-white focus:border focus:border-indigo-200 rounded px-1 py-0.5 transition-all',
+                        style:{width:240}})
+                    )
+                  ),
+                  h('div',{className:'flex items-center gap-1 flex-shrink-0'},
+                    h('button',{
+                      onClick:()=>{setViewingReport(isViewing?null:r.id);window.scrollTo({top:0,behavior:'smooth'});},
+                      className:'text-xs px-2.5 py-1 rounded-lg border transition-all '+(isViewing?'bg-indigo-600 text-white border-indigo-600':'bg-white text-indigo-600 border-indigo-200 hover:bg-indigo-50')
+                    },isViewing?'收起':'查看'),
+                    h('button',{
+                      onClick:()=>exportReportHtml(r.content,r),
+                      className:'text-xs px-2.5 py-1 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50'
+                    },'💾'),
+                    h('button',{
+                      onClick:()=>setDeleteConfirm(r.id),
+                      className:'text-slate-300 hover:text-red-400 transition-colors px-1 text-sm'
+                    },'✕')
+                  )
+                )
+              );
+            })
+          )
+    ),
+
+    // ── 四象限矩阵 ──
     h('div',{className:'bg-white rounded-xl border border-slate-200 p-5'},
       h('div',{className:'flex items-center justify-between mb-4'},
         h('div',{className:'font-bold text-slate-800 text-sm'},'⚡ 四象限博弈矩阵'),
-        h('span',{className:'px-3 py-1 rounded-full text-xs font-bold border '+quadrant.bg+' '+quadrant.color+' '+quadrant.border},
-          quadrant.emoji+' '+quadrant.q+': '+quadrant.label)
+        h('span',{className:'px-3 py-1 rounded-full text-xs font-bold border '+quadrant.bg+' '+quadrant.color+' '+quadrant.border},quadrant.emoji+' '+quadrant.q+': '+quadrant.label)
       ),
       h('div',{className:'grid grid-cols-2 gap-2 mb-4'},
-        [{q:'Q1',e:'⚡',l:'最佳出击',s:'高奖池×冷门',c:'emerald'},
-         {q:'Q2',e:'⚠️',l:'谨慎参与',s:'高奖池×热门',c:'amber'},
-         {q:'Q3',e:'🎯',l:'轻仓守候',s:'普通×冷门', c:'blue'},
-         {q:'Q4',e:'🚫',l:'最小参与',s:'普通×热门', c:'slate'}
+        [{q:'Q1',e:'⚡',l:'最佳出击',s:'高奖池×冷门',c:'emerald'},{q:'Q2',e:'⚠️',l:'谨慎参与',s:'高奖池×热门',c:'amber'},
+         {q:'Q3',e:'🎯',l:'轻仓守候',s:'普通×冷门',c:'blue'},{q:'Q4',e:'🚫',l:'最小参与',s:'普通×热门',c:'slate'}
         ].map(({q,e,l,s,c})=>{
           const active=quadrant.q===q;
-          const cls=active
-            ?`bg-${c}-50 border-${c}-300 text-${c}-800 shadow-sm ring-2 ring-${c}-300`
-            :'bg-slate-50 border-slate-200 text-slate-400';
-          return h('div',{key:q,className:'rounded-xl border-2 p-3 transition-all '+cls},
-            h('div',{className:'text-xs font-bold mb-0.5'},e+' '+q+' '+l),
-            h('div',{className:'text-xs opacity-70'},s)
-          );
+          return h('div',{key:q,className:'rounded-xl border-2 p-3 transition-all '+(active?`bg-${c}-50 border-${c}-300 text-${c}-800 shadow-sm`:'bg-slate-50 border-slate-200 text-slate-400')},
+            h('div',{className:'text-xs font-bold mb-0.5'},e+' '+q+' '+l),h('div',{className:'text-xs opacity-70'},s));
         })
       ),
       h('div',{className:'rounded-lg p-4 '+quadrant.bg+' border '+quadrant.border},
-        h('div',{className:'text-sm font-bold '+quadrant.color+' mb-1'},
-          quadrant.emoji+' '+quadrant.label+'——'+quadrant.desc),
+        h('div',{className:'text-sm font-bold '+quadrant.color+' mb-1'},quadrant.emoji+' '+quadrant.label+'——'+quadrant.desc),
         h('div',{className:'flex gap-4 text-xs mt-2'},
-          h('span',{className:'text-slate-600'},'推荐模式: ',
-            h('strong',{},quadrant.strategy==='dangtuo'?'胆拖':quadrant.strategy==='compound'?'复式':'单式')),
+          h('span',{className:'text-slate-600'},'推荐模式: ',h('strong',{},quadrant.strategy==='dangtuo'?'胆拖':quadrant.strategy==='compound'?'复式':'单式')),
           h('span',{className:'text-slate-600'},'预算系数: ',h('strong',{},'×'+quadrant.budgetMult)),
           h('span',{className:'text-slate-600'},'奖池>3亿: ',h('strong',{className:poolStatus.score>=0.5?'text-emerald-600':'text-slate-400'},poolStatus.score>=0.5?'✅ 是':'❌ 否'))
         )
       )
     ),
 
-    // ── 方案生成器 ──────────────────────────────────────
+    // ── 投注方案生成器 ──
     h('div',{className:'bg-white rounded-xl border border-slate-200 p-5'},
       h('div',{className:'font-bold text-slate-800 text-sm mb-3'},'🎯 投注方案生成器'),
-      !inferenceResult&&h('div',{className:'text-xs text-amber-600 bg-amber-50 rounded-lg px-3 py-2 mb-3 border border-amber-100'},
-        '⚠ 未检测到模型推理结果，将使用均匀随机分布。请先在【模型实验】加载模型并推理以获得最优方案。'),
+      !inferenceResult&&h('div',{className:'text-xs text-amber-600 bg-amber-50 rounded-lg px-3 py-2 mb-3 border border-amber-100'},'⚠ 未检测到模型推理结果，将使用均匀分布。建议先在【模型实验】加载模型并推理。'),
       h('div',{className:'flex flex-wrap items-end gap-3 mb-4'},
         h('div',{},
           h('label',{className:'block text-xs text-slate-500 mb-1'},'本期基准预算 (¥)'),
-          h('input',{type:'number',value:baseBudget,min:10,step:10,
-            onChange:e=>setBaseBudget(+e.target.value||100),
+          h('input',{type:'number',value:baseBudget,min:10,step:10,onChange:e=>setBaseBudget(+e.target.value||100),
             className:'border border-slate-200 rounded-lg px-3 py-2 text-sm w-28 focus:outline-none focus:ring-1 focus:ring-indigo-400'})
         ),
-        h('div',{className:'text-xs text-slate-400 pb-2'},
-          '象限系数×'+quadrant.budgetMult+' → 实际预算 ¥'+Math.round(baseBudget*quadrant.budgetMult)),
+        h('div',{className:'text-xs text-slate-400 pb-2'},'象限系数×'+quadrant.budgetMult+' → 实际预算 ¥'+Math.round(baseBudget*quadrant.budgetMult)),
         h('button',{onClick:handleGenerate,disabled:computing||noData,
-          className:'px-5 py-2 rounded-lg text-sm font-bold transition-all shadow-sm '+
-            (computing||noData?'bg-slate-200 text-slate-400 cursor-not-allowed':'bg-indigo-600 text-white hover:bg-indigo-700')},
+          className:'px-5 py-2 rounded-lg text-sm font-bold transition-all shadow-sm '+(computing||noData?'bg-slate-200 text-slate-400 cursor-not-allowed':'bg-indigo-600 text-white hover:bg-indigo-700')},
           computing?'生成中...':'⚡ 生成决策方案')
       ),
-
-      // 方案展示
       plan&&h('div',{className:'space-y-3'},
-        // 推荐方案（当前象限对应）
         h('div',{className:'text-xs font-bold text-slate-500 uppercase tracking-wide mb-1'},'▶ 推荐方案'),
         plan.plans.filter(p=>plan.recType.includes(p.type)).map((p,i)=>
           h('div',{key:i,className:'rounded-xl border-2 border-indigo-200 bg-indigo-50 overflow-hidden'},
             h('div',{className:'flex items-center justify-between px-4 py-2 bg-indigo-100'},
               h('span',{className:'text-xs font-bold text-indigo-800'},p.label),
-              h('div',{className:'flex items-center gap-3'},
-                h('span',{className:'text-xs text-indigo-600'},p.notes+'注'),
-                h('span',{className:'text-sm font-bold text-indigo-700'},'¥'+p.cost))
+              h('div',{className:'flex items-center gap-3'},h('span',{className:'text-xs text-indigo-600'},p.notes+'注'),h('span',{className:'text-sm font-bold text-indigo-700'},'¥'+p.cost))
             ),
             h('div',{className:'px-4 py-3'},
               h('div',{className:'flex flex-wrap items-center gap-2 mb-2'},
@@ -3976,15 +5220,12 @@ function DecisionLab({data, activeModel, inferenceResult, btSum, btRecs}){
             )
           )
         ),
-        // 其他方案（折叠参考）
         h('div',{className:'text-xs font-bold text-slate-400 uppercase tracking-wide mt-3 mb-1'},'参考方案'),
         plan.plans.filter(p=>!plan.recType.includes(p.type)).map((p,i)=>
           h('div',{key:i,className:'rounded-xl border border-slate-200 bg-slate-50 overflow-hidden'},
             h('div',{className:'flex items-center justify-between px-4 py-2'},
               h('span',{className:'text-xs text-slate-600'},p.label),
-              h('div',{className:'flex items-center gap-3'},
-                h('span',{className:'text-xs text-slate-400'},p.notes+'注'),
-                h('span',{className:'text-sm font-bold text-slate-600'},'¥'+p.cost))
+              h('div',{className:'flex items-center gap-3'},h('span',{className:'text-xs text-slate-400'},p.notes+'注'),h('span',{className:'text-sm font-bold text-slate-600'},'¥'+p.cost))
             ),
             h('div',{className:'px-4 pb-3 flex flex-wrap items-center gap-2'},
               p.danReds&&h('span',{className:'text-xs text-slate-400'},'胆:'),
@@ -3997,52 +5238,47 @@ function DecisionLab({data, activeModel, inferenceResult, btSum, btRecs}){
             )
           )
         ),
-        // 决策摘要
         h('div',{className:'mt-2 p-4 bg-gradient-to-r from-slate-50 to-indigo-50 rounded-xl border border-indigo-100 text-xs'},
           h('div',{className:'font-bold text-indigo-700 mb-2'},'📋 本期决策摘要'),
           h('div',{className:'grid grid-cols-2 md:grid-cols-4 gap-3'},
-            [['博弈象限',plan.quadrant.emoji+' '+plan.quadrant.q+' '+plan.quadrant.label],
-             ['奖池状态',plan.poolStatus.label],
-             ['拥挤信号',plan.crowdSignal.label],
-             ['建议预算','¥'+plan.budget],
-            ].map(([l,v])=>h('div',{key:l},
-              h('div',{className:'text-slate-400'},l),
-              h('div',{className:'font-bold text-slate-700 mt-0.5'},v)))
+            [['博弈象限',plan.quadrant.emoji+' '+plan.quadrant.q+' '+plan.quadrant.label],['奖池状态',plan.poolStatus.label],['拥挤信号',plan.crowdSignal.label],['建议预算','¥'+plan.budget]].map(([l,v])=>h('div',{key:l},h('div',{className:'text-slate-400'},l),h('div',{className:'font-bold text-slate-700 mt-0.5'},v)))
           ),
           h('div',{className:'text-slate-400 mt-2'},'生成: '+plan.ts+(plan.hasModel?' · 模型推理':' · 随机分布（无模型）'))
         )
       )
     ),
 
-    // ── 历史象限分布（懒加载）──────────────────────────
+    // ── 历史象限分布 ──
     h('div',{className:'bg-white rounded-xl border border-slate-200 p-5'},
       h('div',{className:'flex items-center justify-between'},
         h('div',{className:'font-bold text-slate-800 text-sm'},'📊 历史象限分布'),
-        h('button',{onClick:handleShowHist,
-          className:'text-xs px-3 py-1.5 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 transition-all'},
-          showHist?'收起':('展开分析 ('+sorted.length+'期)'))
+        h('button',{onClick:handleShowHist,className:'text-xs px-3 py-1.5 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50'},showHist?'收起':'展开分析 ('+sorted.length+'期)')
       ),
       showHist&&h('div',{className:'mt-4'},
         !histData?h('div',{className:'text-center py-6 text-slate-400 text-sm'},'计算中…')
         :h('div',{},
           h('div',{className:'grid grid-cols-2 md:grid-cols-4 gap-3 mb-3'},
-            [{q:'Q1',l:'⚡ 最佳出击',c:'bg-emerald-500'},
-             {q:'Q2',l:'⚠️ 谨慎参与',c:'bg-amber-500'},
-             {q:'Q3',l:'🎯 轻仓守候',c:'bg-blue-500'},
-             {q:'Q4',l:'🚫 最小参与',c:'bg-slate-400'}
-            ].map(({q,l,c})=>h('div',{key:q,className:'p-3 rounded-xl bg-slate-50 border border-slate-200'},
-              h('div',{className:'text-xs text-slate-500 mb-1'},l),
-              h('div',{className:'text-xl font-bold text-slate-800'},histData.pct[q]+'%'),
-              h('div',{className:'text-xs text-slate-400'},histData.stats[q]+'期 / '+histData.total+'期'),
-              h('div',{className:'mt-2 h-1.5 bg-slate-200 rounded-full overflow-hidden'},
-                h('div',{className:'h-full '+c+' rounded-full',style:{width:histData.pct[q]+'%'}}))
-            ))
+            [{q:'Q1',l:'⚡ 最佳出击',c:'bg-emerald-500'},{q:'Q2',l:'⚠️ 谨慎参与',c:'bg-amber-500'},{q:'Q3',l:'🎯 轻仓守候',c:'bg-blue-500'},{q:'Q4',l:'🚫 最小参与',c:'bg-slate-400'}].map(({q,l,c})=>
+              h('div',{key:q,className:'p-3 rounded-xl bg-slate-50 border border-slate-200'},
+                h('div',{className:'text-xs text-slate-500 mb-1'},l),
+                h('div',{className:'text-xl font-bold text-slate-800'},histData.pct[q]+'%'),
+                h('div',{className:'text-xs text-slate-400'},histData.stats[q]+'期 / '+histData.total+'期'),
+                h('div',{className:'mt-2 h-1.5 bg-slate-200 rounded-full overflow-hidden'},h('div',{className:'h-full '+c+' rounded-full',style:{width:histData.pct[q]+'%'}}))
+              )
+            )
           ),
-          h('div',{className:'text-xs text-slate-400 bg-slate-50 rounded-lg px-4 py-3 border border-slate-100'},
-            'Q1最佳出击历史占比',histData.pct.Q1,'%（',histData.stats.Q1,'期），',
-            '理论上仅参与Q1+奖池>3亿期次可大幅提升单期期望值。',
-            'Q4最差组合',histData.pct.Q4,'%，可完全跳过节省成本。'
-          )
+          h('div',{className:'text-xs text-slate-400 bg-slate-50 rounded-lg px-4 py-3 border border-slate-100'},'Q1最佳出击历史占比'+histData.pct.Q1+'%（'+histData.stats.Q1+'期），仅参与Q1+奖池>3亿期次可大幅提升单期期望值。Q4最差组合'+histData.pct.Q4+'%，可完全跳过。')
+        )
+      )
+    ),
+
+    // ── 删除确认弹窗 ──
+    deleteConfirm!=null&&h('div',{className:'fixed inset-0 z-50 flex items-center justify-center',style:{background:'rgba(0,0,0,0.4)'}},
+      h('div',{className:'bg-white rounded-2xl shadow-2xl p-6 max-w-sm w-full mx-4'},
+        h('div',{className:'text-center mb-4'},h('div',{style:{fontSize:40}},'🗑️'),h('div',{className:'font-bold text-slate-800 mt-2'},'删除AI研判报告'),h('div',{className:'text-sm text-slate-500 mt-1'},'此操作不可撤销')),
+        h('div',{className:'flex gap-3'},
+          h('button',{onClick:()=>setDeleteConfirm(null),className:'flex-1 py-2.5 rounded-xl border border-slate-200 text-slate-600 text-sm font-medium hover:bg-slate-50'},'取消'),
+          h('button',{onClick:()=>deleteAiRec(deleteConfirm),className:'flex-1 py-2.5 rounded-xl bg-red-500 text-white text-sm font-bold hover:bg-red-600'},'确认删除')
         )
       )
     )
@@ -4050,6 +5286,309 @@ function DecisionLab({data, activeModel, inferenceResult, btSum, btRecs}){
 }
 
 
+function openManual(){
+  const html=`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
+<title>SSQ 量化预测系统 操作手册 v1.5.2</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:'PingFang SC','Helvetica Neue',sans-serif;margin:0;background:#f8fafc;color:#1e293b;line-height:1.7}
+.sidebar{position:fixed;left:0;top:0;bottom:0;width:220px;background:#0f172a;color:#cbd5e1;overflow-y:auto;padding:20px 0}
+.sidebar h1{font-size:13px;font-weight:700;color:#818cf8;padding:0 20px 12px;border-bottom:1px solid #1e293b;margin:0 0 8px}
+.sidebar a{display:block;padding:6px 20px;font-size:12px;color:#94a3b8;text-decoration:none;cursor:pointer;border-left:2px solid transparent;transition:all .15s}
+.sidebar a:hover,.sidebar a.active{color:#e2e8f0;background:#1e293b;border-left-color:#6366f1}
+.sidebar .section{padding:8px 20px 4px;font-size:10px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:.08em;margin-top:8px}
+.main{margin-left:220px;padding:40px 48px;max-width:960px}
+h2{font-size:20px;font-weight:700;color:#1e293b;margin:40px 0 12px;padding-bottom:8px;border-bottom:2px solid #e2e8f0}
+h2:first-of-type{margin-top:0}
+h3{font-size:15px;font-weight:700;color:#4f46e5;margin:24px 0 8px}
+h4{font-size:13px;font-weight:700;color:#334155;margin:16px 0 6px}
+p,li{font-size:13px;color:#475569;margin:4px 0}
+ul,ol{padding-left:20px}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700}
+.badge-new{background:#dbeafe;color:#1d4ed8}
+.badge-tip{background:#d1fae5;color:#065f46}
+.badge-warn{background:#fef3c7;color:#92400e}
+.badge-v{background:#ede9fe;color:#5b21b6}
+table{width:100%;border-collapse:collapse;margin:12px 0;font-size:12px}
+th{background:#f1f5f9;padding:8px 12px;text-align:left;font-weight:700;color:#334155;border:1px solid #e2e8f0}
+td{padding:7px 12px;border:1px solid #e2e8f0;color:#475569;vertical-align:top}
+tr:hover td{background:#f8fafc}
+.card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:16px 20px;margin:12px 0}
+.card-blue{background:#eff6ff;border-color:#bfdbfe}
+.card-green{background:#f0fdf4;border-color:#bbf7d0}
+.card-amber{background:#fffbeb;border-color:#fde68a}
+.card-red{background:#fff1f2;border-color:#fecdd3}
+.step{display:flex;gap:12px;margin:10px 0;align-items:flex-start}
+.step-num{width:24px;height:24px;border-radius:50%;background:#4f46e5;color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:2px}
+code{background:#f1f5f9;padding:1px 6px;border-radius:4px;font-size:12px;font-family:monospace;color:#7c3aed}
+.tag{display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px;font-weight:600;margin:1px}
+.tag-r{background:#fee2e2;color:#dc2626}
+.tag-b{background:#dbeafe;color:#2563eb}
+.toc-link{cursor:pointer}
+hr{border:none;border-top:1px dashed #e2e8f0;margin:28px 0}
+</style></head><body>
+<div class="sidebar">
+  <h1>📖 SSQ 操作手册<br><span style="color:#475569;font-weight:400">v1.5.2-stable</span></h1>
+  <div class="section">快速开始</div>
+  <a href="#sec-start" onclick="goto('sec-start')">🚀 快速开始</a>
+  <a href="#sec-csv" onclick="goto('sec-csv')">📁 CSV数据格式</a>
+  <div class="section">功能模块</div>
+  <a href="#sec-data" onclick="goto('sec-data')">① 数据总控</a>
+  <a href="#sec-validate" onclick="goto('sec-validate')">② 数据契约</a>
+  <a href="#sec-feature" onclick="goto('sec-feature')">③ 特征实验</a>
+  <a href="#sec-model" onclick="goto('sec-model')">④ 模型实验</a>
+  <a href="#sec-backtest" onclick="goto('sec-backtest')">⑤ 历史回测</a>
+  <a href="#sec-dashboard" onclick="goto('sec-dashboard')">⑥ 量化看板</a>
+  <a href="#sec-stat" onclick="goto('sec-stat')">⑦ 统计检验</a>
+  <a href="#sec-decision" onclick="goto('sec-decision')">⑧ 智能决策</a>
+  <div class="section">进阶</div>
+  <a href="#sec-colab" onclick="goto('sec-colab')">☁ Colab训练</a>
+  <a href="#sec-features69" onclick="goto('sec-features69')">🔬 69维特征表</a>
+  <a href="#sec-changelog" onclick="goto('sec-changelog')">📋 更新日志</a>
+</div>
+<div class="main">
+
+<h2 id="sec-start">🚀 快速开始（5步上手）</h2>
+<div class="step"><div class="step-num">1</div><div><strong>准备CSV数据</strong>：将双色球历史开奖记录整理为CSV格式（见下方格式说明），建议至少300期以上数据。</div></div>
+<div class="step"><div class="step-num">2</div><div><strong>加载数据</strong>：点击顶部「📁 选择CSV文件」上传，系统自动解析并按时间排序，拖动滑块设置训练/测试切分比例（推荐80%/20%）。</div></div>
+<div class="step"><div class="step-num">3</div><div><strong>验证数据</strong>：切换至「数据契约」标签，检查数据完整性报告，确认无错误后继续。</div></div>
+<div class="step"><div class="step-num">4</div><div><strong>训练或加载模型</strong>：<br>
+  • 浏览器内训练：「模型实验」→ 选择 <code>XGBoost(浏览器)</code> → 点击训练<br>
+  • 离线训练：「模型实验」→ 下载数据.csv和脚本.py → Colab运行 → 下载zip → 上传model.json+.bin</div></div>
+<div class="step"><div class="step-num">5</div><div><strong>生成决策报告</strong>：切换至「智能决策」→ 配置Gemini API Key → 点击「⚡ 生成AI研判报告」，获取综合分析。</div></div>
+
+<hr>
+<h2 id="sec-csv">📁 CSV数据格式规范</h2>
+<h3>最小格式（9列，必须）</h3>
+<table>
+<tr><th>列名</th><th>说明</th><th>示例</th></tr>
+<tr><td><code>期号</code></td><td>开奖期号</td><td>2026001</td></tr>
+<tr><td><code>日期</code></td><td>开奖日期 YYYY/MM/DD</td><td>2026/01/02</td></tr>
+<tr><td><code>R1~R6</code></td><td>6个红球号码（1-33，已排序）</td><td>3,8,14,21,27,30</td></tr>
+<tr><td><code>Blue</code></td><td>蓝球号码（1-16）</td><td>7</td></tr>
+</table>
+<h3>完整格式（29列，解锁全部功能）</h3>
+<p>在最小格式基础上追加以下列，可解锁69维特征和博弈信号：</p>
+<table>
+<tr><th>列名</th><th>说明</th><th>对应功能</th></tr>
+<tr><td><code>OrdR1~OrdR6</code></td><td>摇号出球顺序（第几个摇出的号码）</td><td>摇号位置特征[49-50]</td></tr>
+<tr><td><code>Sales</code></td><td>本期销售额（元）</td><td>投注热度特征[52][60]</td></tr>
+<tr><td><code>Jackpot</code></td><td>本期奖金池（元）</td><td>奖池特征[51][56][68]</td></tr>
+<tr><td><code>Prize1Count/Amount</code></td><td>一等奖注数/金额</td><td>稀缺度/拥挤度特征[53-55]</td></tr>
+<tr><td><code>Prize2~Prize6 Count/Amount</code></td><td>二到六等奖注数/金额</td><td>博弈深度特征</td></tr>
+</table>
+<div class="card card-amber"><strong>⚠ 注意</strong>：列名大小写不敏感，中英文均支持。如列名含「期号/日期/红/蓝球」等关键词会自动识别。数据缺失的扩展字段会以中性值填充，不影响基础功能。</div>
+
+<hr>
+<h2 id="sec-data">① 数据总控</h2>
+<p>CSV加载后的数据预览面板，显示解析出的所有期次记录，含开奖号码、摇号顺序、奖池/销售等扩展字段（如有）。</p>
+<h4>训练/测试切分</h4>
+<p>顶部滑块控制训练集比例（50%~95%，默认80%）。训练集用于模型学习，测试集用于回测评估。切分按时间顺序进行，较早数据为训练集，较新数据为测试集。</p>
+
+<hr>
+<h2 id="sec-validate">② 数据契约</h2>
+<p>自动检查数据质量，输出详细报告：</p>
+<ul>
+<li><strong>格式错误</strong>：红球重复、号码越界（红1-33/蓝1-16）</li>
+<li><strong>异常检测</strong>：红球和值超出合理范围（50-180）</li>
+<li><strong>连续性检查</strong>：发现断档超过8天的缺失期次</li>
+<li><strong>字段覆盖率</strong>：统计摇号顺序、奖池、销售额等扩展字段的数据完整性百分比</li>
+</ul>
+<div class="card card-green"><strong>💡 建议</strong>：数据契约无红色错误才进行模型训练，否则可能影响特征质量。黄色警告可接受。</div>
+
+<hr>
+<h2 id="sec-feature">③ 特征实验</h2>
+<p>可视化探索69维特征工程的分布情况，帮助理解模型输入。</p>
+<h4>LookBack（记忆窗口）</h4>
+<p>控制LSTM每次看多少期历史来预测下一期。推荐30期。数据量少时可用10-20期。</p>
+<h4>特征维度说明</h4>
+<p>详见本手册末尾「<a onclick="goto('sec-features69')" style="color:#4f46e5;cursor:pointer">69维特征完整表</a>」。</p>
+
+<hr>
+<h2 id="sec-model">④ 模型实验</h2>
+<h3>两种模型</h3>
+<table>
+<tr><th>模型</th><th>训练方式</th><th>特点</th><th>推荐场景</th></tr>
+<tr><td><strong>LSTM</strong></td><td>Google Colab离线训练</td><td>时序建模，参数多，需GPU加速</td><td>数据量>500期，追求精度</td></tr>
+<tr><td><strong>XGBoost</strong> <span class="badge badge-new">浏览器内</span></td><td>直接在浏览器训练</td><td>无需外部环境，梯度提升树，速度快</td><td>快速上手，数据量200-1000期</td></tr>
+</table>
+<h3>LSTM 离线训练流程</h3>
+<div class="step"><div class="step-num">1</div><div>设置LookBack参数（与回测一致），点击「↓ 数据.csv」导出训练数据</div></div>
+<div class="step"><div class="step-num">2</div><div>点击「↓ 脚本.py」下载Python脚本，或「复制代码」粘贴到Colab</div></div>
+<div class="step"><div class="step-num">3</div><div>在Google Colab运行脚本，上传CSV，等待训练完成（约5-15分钟，GPU模式）</div></div>
+<div class="step"><div class="step-num">4</div><div>下载输出的 <code>model_artifacts.zip</code>，本地解压</div></div>
+<div class="step"><div class="step-num">5</div><div>在平台「加载训练模型」区域，同时选中 <code>model.json</code> 和 <code>.bin</code> 文件上传（Ctrl/Cmd多选）</div></div>
+<h3>XGBoost 浏览器训练</h3>
+<div class="step"><div class="step-num">1</div><div>在「模型实验」顶部选择 <code>XGBoost（浏览器内训练）</code></div></div>
+<div class="step"><div class="step-num">2</div><div>配置树参数（树数量/学习率/最大深度），点击「🌲 开始训练XGBoost」</div></div>
+<div class="step"><div class="step-num">3</div><div>训练完成后自动激活为当前模型，可直接推理和回测</div></div>
+<h3>推理与策略优化</h3>
+<p>模型就绪后，点击「⚡ 运行推理」获取红蓝球概率分布。然后在「策略优化」区调整约束条件，点击「遗传算法优化」生成多样化号码组合：</p>
+<ul>
+<li><strong>和值约束</strong>：限定6红球之和的范围（理论均值102）</li>
+<li><strong>奇偶比</strong>：控制奇偶数比例（Any/3:3/4:2）</li>
+<li><strong>冷门偏好系数</strong>：0%=纯概率优先，100%=纯冷门优先，推荐30-50%</li>
+</ul>
+
+<hr>
+<h2 id="sec-backtest">⑤ 历史回测</h2>
+<p>在测试集上模拟完整投注流程，评估模型实际表现。</p>
+<h3>投注模式</h3>
+<table>
+<tr><th>模式</th><th>说明</th><th>每期成本</th></tr>
+<tr><td>单式</td><td>每期1注，2元，最简单</td><td>¥2</td></tr>
+<tr><td>复式</td><td>选N个红球（6-10）组合，C(N,6)注</td><td>¥14~¥420</td></tr>
+<tr><td>胆拖</td><td>胆码（必中）+ 拖码组合，C(拖N, 6-胆N)注</td><td>视配置</td></tr>
+<tr><td><strong>动态博弈</strong> <span class="badge badge-new">v1.4</span></td><td>根据奖池门槛和拥挤度自动切换策略</td><td>动态</td></tr>
+</table>
+<h3>进度与结果</h3>
+<p>点击「▶ 开始回测」后，进度条实时显示当前处理期数和百分比。回测完成后输出：</p>
+<ul>
+<li><strong>核心指标</strong>：ROI、RTP返奖率、最终余额、最大回撤、中奖率</li>
+<li><strong>模型 vs 随机基准</strong>：与随机选号对比，判断模型是否有真实优势</li>
+<li><strong>生存分析</strong>：连续N期至少中一次各等级的历史概率</li>
+<li><strong>权益曲线</strong>：资金随时间变化的可视化折线图</li>
+</ul>
+<h3>历史记录管理</h3>
+<p>每次回测结果自动保存（最多50条）。可星标重点记录、添加备注、多选横向比较，或导出CSV。选中2条以上自动显示横向对比表。</p>
+
+<hr>
+<h2 id="sec-dashboard">⑥ 量化看板</h2>
+<p>基于训练集数据的统计可视化面板：</p>
+<ul>
+<li><strong>红球热力图</strong>：1-33号码历史出现频次热图</li>
+<li><strong>蓝球分布</strong>：16个蓝球出现频次柱状图</li>
+<li><strong>和值分布</strong>：近期红球和值走势与历史均值对比</li>
+<li><strong>凯利公式</strong>：基于回测RTP和平均奖金池，估算最优投注比例</li>
+</ul>
+
+<hr>
+<h2 id="sec-stat">⑦ 统计检验</h2>
+<p>对历史数据进行严格统计检验，判断是否存在非随机规律：</p>
+<h4>卡方频率检验</h4>
+<p>对红球（df=32）和蓝球（df=15）分别检验频率是否均匀分布。χ²>临界值则拒绝均匀假设。</p>
+<h4>游程检验</h4>
+<p>检验蓝球序列和红球和值序列的随机性。|Z|>1.96则序列存在非随机模式。</p>
+<h4>自相关分析</h4>
+<p>检测蓝球序列和红球和值的1-20阶自相关，寻找周期性规律。超出95%置信区间（±1.96/√n）的滞后阶具有统计显著性。</p>
+<div class="card card-amber"><strong>⚠ 重要提示</strong>：统计显著 ≠ 可预测。即使存在非随机性，也不代表可以从中获利。建议样本量>300期后结果更可靠。</div>
+
+<hr>
+<h2 id="sec-decision">⑧ 智能决策 <span class="badge badge-new">AI驱动</span></h2>
+<p>整合所有数据源，调用 Gemini 2.5 Flash 生成专业决策报告。</p>
+<h3>配置 Gemini API Key</h3>
+<div class="step"><div class="step-num">1</div><div>访问 <code>aistudio.google.com/apikey</code>，登录Google账号</div></div>
+<div class="step"><div class="step-num">2</div><div>点击 Create API Key，复制生成的Key（以 AIzaSy 开头）</div></div>
+<div class="step"><div class="step-num">3</div><div>点击平台右上角🔐按钮，粘贴Key并保存（仅存储在本地浏览器，不上传服务器）</div></div>
+<h3>报告内容（6个章节）</h3>
+<table>
+<tr><th>章节</th><th>内容</th></tr>
+<tr><td>一、市场博弈环境研判</td><td>奖池积累程度、拥挤度信号分析</td></tr>
+<tr><td>二、数据信号综合解读</td><td>热冷号统计、和值跨度规律、LSTM概率分布</td></tr>
+<tr><td>三、历史回测绩效评估</td><td>ROI/RTP趋势、模型综合评级</td></tr>
+<tr><td>四、本期操作结论（重点）</td><td>参与建议、投注模式、核心选号方案、建议投入金额</td></tr>
+<tr><td>五、资金管理建议</td><td>单期上限、回本周期估算、止损建议</td></tr>
+<tr><td>六、下期重点观察指标</td><td>3个具体数据阈值</td></tr>
+</table>
+<h3>四象限博弈矩阵</h3>
+<table>
+<tr><th>象限</th><th>条件</th><th>策略</th><th>预算系数</th></tr>
+<tr><td>⚡ Q1 最佳出击</td><td>高奖池 × 冷门格局</td><td>激进胆拖</td><td>×2.0</td></tr>
+<tr><td>⚠️ Q2 谨慎参与</td><td>高奖池 × 热门集中</td><td>保守复式</td><td>×0.5</td></tr>
+<tr><td>🎯 Q3 轻仓守候</td><td>普通奖期 × 冷门</td><td>单式保守</td><td>×1.0</td></tr>
+<tr><td>🚫 Q4 最小参与</td><td>普通奖期 × 热门</td><td>最小或跳过</td><td>×0.25</td></tr>
+</table>
+<h3>报告历史管理</h3>
+<p>每次生成的报告自动保存（最多50条），支持：</p>
+<ul>
+<li>⭐ 星标标记重点报告</li>
+<li>📝 添加备注</li>
+<li>💾 单独保存为HTML文件（完整排版，可打印）</li>
+<li>🔍 点击「查看」在主面板预览历史报告</li>
+</ul>
+<div class="card card-red"><strong>🔴 Token截断说明</strong>：如报告末尾出现「⚠️ 注意：报告因Token上限被截断」提示，请点击重新生成。v1.5.2已将Token上限从4000提升至8192，正常情况下不会截断。</div>
+
+<hr>
+<h2 id="sec-colab">☁ Google Colab 离线训练指南</h2>
+<p>Colab提供免费T4 GPU，训练速度比本地快10-50倍。</p>
+<div class="step"><div class="step-num">1</div><div>打开 <code>colab.google.com</code>，新建笔记本，选择「T4 GPU」运行时</div></div>
+<div class="step"><div class="step-num">2</div><div>从平台「模型实验」→「离线训练套件」下载 <code>training_data.csv</code> 和 <code>ssq_training.py</code></div></div>
+<div class="step"><div class="step-num">3</div><div>在Colab新建代码单元，粘贴脚本全部内容，运行（第一次运行会安装依赖约2分钟）</div></div>
+<div class="step"><div class="step-num">4</div><div>按提示上传 <code>training_data.csv</code>，等待训练（100 epochs，约5-10分钟）</div></div>
+<div class="step"><div class="step-num">5</div><div>训练完成后自动下载 <code>model_artifacts.zip</code>，解压得到 <code>model.json</code> 和 <code>group1-shard1of1.bin</code></div></div>
+<div class="step"><div class="step-num">6</div><div>回到平台「加载训练模型」，同时选中这两个文件上传（Ctrl/Cmd多选），状态变绿即成功</div></div>
+<div class="card card-blue"><strong>💡 超参数建议</strong>：LOOK_BACK与平台LookBack设置保持一致（推荐30）。UNITS_LSTM=128, DROPOUT=0.3适合大多数情况。数据量>800期可尝试UNITS_LSTM=256。</div>
+
+<hr>
+<h2 id="sec-features69">🔬 69维特征完整说明</h2>
+<table>
+<tr><th>维度</th><th>特征名</th><th>说明</th><th>数据来源</th></tr>
+<tr><td>[0-32]</td><td>红球 one-hot</td><td>33个红球是否开出（0/1）</td><td>基础</td></tr>
+<tr><td>[33-48]</td><td>蓝球 one-hot</td><td>16个蓝球是否开出（0/1）</td><td>基础</td></tr>
+<tr><td>[49]</td><td>摇号位置均值</td><td>6个红球平均出球顺序，归一化[0,1]</td><td>摇号顺序</td></tr>
+<tr><td>[50]</td><td>摇号位置方差</td><td>出球顺序集中/分散程度，归一化[0,1]</td><td>摇号顺序</td></tr>
+<tr><td>[51]</td><td>奖金池归一化</td><td>本期奖池/历史最大奖池</td><td>奖池数据</td></tr>
+<tr><td>[52]</td><td>销售额归一化</td><td>本期销售额/历史最高销售额</td><td>销售数据</td></tr>
+<tr><td>[53]</td><td>一等奖稀缺度</td><td>1/(一等奖注数+1)，越高越稀缺</td><td>奖级数据</td></tr>
+<tr><td>[54]</td><td>号码组合拥挤度反向</td><td>1 - 一等奖注数/历史最大，越低越拥挤</td><td>奖级数据</td></tr>
+<tr><td>[55]</td><td>实际拥挤度</td><td>实际中奖注数/期望中奖注数（博弈热度）</td><td>销售+奖级</td></tr>
+<tr><td>[56]</td><td>奖池积累倍率</td><td>奖池/销售额，归一化到[0,1]</td><td>奖池+销售</td></tr>
+<tr><td>[57]</td><td>连续积累深度</td><td>连续N期无一等奖，min(N/10,1)</td><td>奖级数据</td></tr>
+<tr><td>[58]</td><td>上期拥挤度</td><td>前一期的实际拥挤度（滞后效应）</td><td>奖级数据</td></tr>
+<tr><td>[59]</td><td>二等奖金额</td><td>二等奖总金额归一化（选号集中度代理）</td><td>奖级数据</td></tr>
+<tr><td>[60]</td><td>投注热度增长率</td><td>本期/上期销售额比值，归一化</td><td>销售数据</td></tr>
+<tr><td>[61]</td><td>月份sin</td><td>月份周期性编码，sin分量</td><td>日期</td></tr>
+<tr><td>[62]</td><td>月份cos</td><td>月份周期性编码，cos分量</td><td>日期</td></tr>
+<tr><td>[63]</td><td>周日标志</td><td>是否为周日开奖（周日销售额通常更高）</td><td>日期</td></tr>
+<tr><td>[64]</td><td>红球和值归一化</td><td>(和值-21)/(189-21)，映射到[0,1]</td><td>基础</td></tr>
+<tr><td>[65]</td><td>红球均匀性</td><td>6球最小间距/最大间距，越大越均匀</td><td>基础</td></tr>
+<tr><td>[66]</td><td>六等奖注数</td><td>六等奖注数/历史最大，实际投注量代理指标</td><td>奖级数据</td></tr>
+<tr><td>[67]</td><td>五六等奖比值</td><td>五等奖/六等奖注数比，归一化</td><td>奖级数据</td></tr>
+<tr><td>[68]</td><td>奖池档位</td><td>四档离散编码：0/0.33/0.67/1.0</td><td>奖池数据</td></tr>
+</table>
+<div class="card card-blue"><strong>💡 无数据时的处理</strong>：当某维度对应数据缺失时（如未提供摇号顺序），该维度自动填充中性值（通常为0.5），模型仍可正常运行，但该特征的预测贡献会降低。</div>
+
+<hr>
+<h2 id="sec-changelog">📋 更新日志</h2>
+<table>
+<tr><th>版本</th><th>更新内容</th></tr>
+<tr><td><strong>v1.5.2-stable</strong> <span class="badge badge-v">当前</span></td><td>修复AI报告显示截断（overflow-hidden阻断滚动条）；maxOutputTokens 4000→8192解决内容截断；新增finishReason检测；md2html转换器修复；进度条实时更新每期百分比；版本号统一；手册全面更新</td></tr>
+<tr><td>v1.5.0</td><td>新增纯JS XGBoost/GBM实现（浏览器内训练，无需Colab）；特征55维→69维（+14个博弈特征）；回测支持LSTM/XGB/集成三模型横向比较；智能决策集成Gemini API</td></tr>
+<tr><td>v1.4.0</td><td>动态博弈投注模式；四象限博弈矩阵；AI综合研判报告；回测历史记录管理（星标/备注/比较）</td></tr>
+<tr><td>v1.3.0</td><td>历史回测复式/胆拖投注模式；随机基准对照；生存分析；权益曲线</td></tr>
+<tr><td>v1.2.0</td><td>统计检验模块（卡方/游程/自相关）；量化看板；数据契约报告</td></tr>
+<tr><td>v1.1.0</td><td>特征实验室；Colab训练脚本；MC Dropout不确定性估计</td></tr>
+</table>
+
+<div style="margin-top:48px;padding-top:16px;border-top:1px solid #e2e8f0;font-size:12px;color:#94a3b8;text-align:center">
+  SSQ 量化预测系统 v1.5.2-stable &nbsp;|&nbsp; 仅供学习研究，彩票存在随机性，理性娱乐 &nbsp;|&nbsp; 本手册与系统同步更新
+</div>
+</div>
+<script>
+function goto(id){
+  const el=document.getElementById(id);
+  if(el){el.scrollIntoView({behavior:'smooth',block:'start'});}
+  document.querySelectorAll('.sidebar a').forEach(a=>{
+    a.classList.toggle('active', a.getAttribute('onclick')&&a.getAttribute('onclick').includes(id));
+  });
+}
+// Highlight active section on scroll
+window.addEventListener('scroll',()=>{
+  const sections=document.querySelectorAll('h2[id]');
+  let current='';
+  sections.forEach(s=>{if(s.getBoundingClientRect().top<120)current=s.id;});
+  document.querySelectorAll('.sidebar a').forEach(a=>{
+    const oc=a.getAttribute('onclick')||'';
+    a.classList.toggle('active',oc.includes(current)&&current!=='');
+  });
+});
+<\/script>
+</body></html>`;
+  const blob=new Blob([html],{type:'text/html;charset=utf-8'});
+  const url=URL.createObjectURL(blob);
+  window.open(url,'_blank');
+  setTimeout(()=>URL.revokeObjectURL(url),5000);
+}
 
 function App(){
   const [tab,setTab]=useState('data');
@@ -4090,7 +5629,7 @@ function App(){
           ),
           h('div',{},
             h('div',{className:'text-base font-bold tracking-tight leading-tight'},'SSQ 量化预测系统'),
-            h('div',{className:'text-xs text-indigo-400 font-mono leading-tight'},'v1.4.0')
+            h('div',{className:'text-xs text-indigo-400 font-mono leading-tight'},'v1.5.2-stable')
           )
         ),
         h('nav',{className:'tab-scroll flex items-center space-x-1 bg-slate-800/80 p-1 rounded-xl border border-slate-700/50'},
@@ -4101,7 +5640,7 @@ function App(){
             t.l
           ))
         ),
-        h('button',{onClick:()=>window.open('SSQ-manual-v1.1.5.html','_blank'),
+        h('button',{onClick:()=>openManual(),
           className:'ml-2 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:text-white hover:bg-slate-700/60 border border-slate-700/60 transition-all whitespace-nowrap flex-shrink-0',
           title:'打开操作手册'},
           h('span',{},'📖'), '手册'
