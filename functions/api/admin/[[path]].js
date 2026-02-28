@@ -160,5 +160,69 @@ export async function onRequest(context) {
     return ok({ logs, total: logs.length });
   }
 
+  // GET /api/admin/upgrade-reqs — 获取所有升级申请
+  if (path.endsWith('/upgrade-reqs') && request.method === 'GET') {
+    if (!isAdmin) return err('权限不足', 403);
+    const result = await kv.list({ prefix: 'upgrade_req:' });
+    const reqs = [];
+    for (const key of result.keys) {
+      const raw = await kv.get(key.name);
+      if (raw) reqs.push(JSON.parse(raw));
+    }
+    reqs.sort((a, b) => b.requestedAt - a.requestedAt);
+    return ok({ reqs });
+  }
+
+  // POST /api/admin/upgrade-reqs/submit — 用户提交升级申请
+  if (path.endsWith('/upgrade-reqs/submit') && request.method === 'POST') {
+    const username = td.username;
+    const existing = await kv.get(`upgrade_req:${username}`);
+    if (existing) {
+      const ex = JSON.parse(existing);
+      if (ex.status === 'pending') return err('您已提交过申请，请等待审批');
+    }
+    const req = { username, requestedAt: Date.now(), status: 'pending', processedAt: null, processedBy: null };
+    await kv.put(`upgrade_req:${username}`, JSON.stringify(req));
+    await writeLog(kv, username, 'request_upgrade', {});
+    return ok({}, '升级申请已提交');
+  }
+
+  // POST /api/admin/upgrade-reqs/process — 管理员审批
+  if (path.endsWith('/upgrade-reqs/process') && request.method === 'POST') {
+    if (!isAdmin) return err('权限不足', 403);
+    let body; try { body = await request.json(); } catch { return err('Invalid JSON'); }
+    const { username, approve } = body;
+    if (!username) return err('请指定用户名');
+    const raw = await kv.get(`upgrade_req:${username}`);
+    if (!raw) return err('申请不存在');
+    const req = JSON.parse(raw);
+    req.status = approve ? 'approved' : 'rejected';
+    req.processedAt = Date.now();
+    req.processedBy = td.username;
+    await kv.put(`upgrade_req:${username}`, JSON.stringify(req));
+    if (approve) {
+      const uraw = await kv.get(`user:${username}`);
+      if (uraw) {
+        const u = JSON.parse(uraw);
+        u.role = 'professional';
+        await kv.put(`user:${username}`, JSON.stringify(u));
+        // 使该用户的 token 失效（下次登录时重新获取新角色）
+        const tokenList = await kv.list({ prefix: 'token:' });
+        for (const tk of tokenList.keys) {
+          const traw = await kv.get(tk.name);
+          if (traw) {
+            const td2 = JSON.parse(traw);
+            if (td2.username === username) {
+              td2.role = 'professional';
+              await kv.put(tk.name, JSON.stringify(td2));
+            }
+          }
+        }
+      }
+    }
+    await writeLog(kv, td.username, approve ? 'approve_upgrade' : 'reject_upgrade', { target: username });
+    return ok({}, approve ? '已批准升级' : '已拒绝申请');
+  }
+
   return err('Not Found', 404);
 }
