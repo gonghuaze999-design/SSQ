@@ -33,7 +33,7 @@ export async function onRequest(context) {
   const { action, detail = {} } = body;
   if (!action) return err('action 不能为空');
 
-  const allowed = ['calculate', 'view_result', 'export', 'change_settings', 'view_history'];
+  const allowed = ['calculate', 'view_result', 'export', 'change_settings', 'view_history', '申请升级专业版', 'tab_visit'];
   if (!allowed.includes(action)) return err('无效的操作类型');
 
   const ts = Date.now();
