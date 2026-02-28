@@ -113,13 +113,67 @@ export async function onRequest(context) {
   if (path.endsWith('/delete') && request.method === 'POST') {
     if (!isSuperadmin) return err('权限不足', 403);
     let body; try { body = await request.json(); } catch { return err('Invalid JSON'); }
-    const { username } = body;
+    // 兼容前端传 userId 或 username
+    const username = body.username || body.userId;
     if (!username) return err('请指定用户名');
     if (username === td.username) return err('不能删除自己');
     if (!(await kv.get(`user:${username}`))) return err('用户不存在');
     await kv.delete(`user:${username}`);
     await writeLog(kv, td.username, 'admin_delete_user', { target: username });
     return ok({}, `用户 ${username} 已删除`);
+  }
+
+  // POST /api/admin/upgrade/request — 用户申请升级，写入KV
+  if (path.endsWith('/upgrade/request') && request.method === 'POST') {
+    const username = td.username;
+    const key = `upgrade:${username}`;
+    const existing = await kv.get(key);
+    if (existing) {
+      const ex = JSON.parse(existing);
+      if (ex.status === 'pending') return err('您已有一条待审批的升级申请');
+    }
+    await kv.put(key, JSON.stringify({ username, requestedAt: Date.now(), status: 'pending' }));
+    await writeLog(kv, username, 'request_upgrade', {});
+    return ok({}, '升级申请已提交，等待管理员审批');
+  }
+
+  // GET /api/admin/upgrade/list — 管理员获取所有升级申请
+  if (path.endsWith('/upgrade/list') && request.method === 'GET') {
+    if (!isSuperadmin) return err('权限不足', 403);
+    const result = await kv.list({ prefix: 'upgrade:' });
+    const reqs = [];
+    for (const key of result.keys) {
+      const raw = await kv.get(key.name);
+      if (raw) reqs.push(JSON.parse(raw));
+    }
+    reqs.sort((a, b) => b.requestedAt - a.requestedAt);
+    return ok({ reqs });
+  }
+
+  // POST /api/admin/upgrade/approve — 管理员审批
+  if (path.endsWith('/upgrade/approve') && request.method === 'POST') {
+    if (!isSuperadmin) return err('权限不足', 403);
+    let body; try { body = await request.json(); } catch { return err('Invalid JSON'); }
+    const { username, approve } = body;
+    if (!username) return err('请指定用户名');
+    const key = `upgrade:${username}`;
+    const raw = await kv.get(key);
+    if (!raw) return err('找不到该申请');
+    const req = JSON.parse(raw);
+    req.status = approve ? 'approved' : 'rejected';
+    req.processedAt = Date.now();
+    req.processedBy = td.username;
+    await kv.put(key, JSON.stringify(req));
+    if (approve) {
+      const userRaw = await kv.get(`user:${username}`);
+      if (userRaw) {
+        const u = JSON.parse(userRaw);
+        u.role = 'professional';
+        await kv.put(`user:${username}`, JSON.stringify(u));
+      }
+    }
+    await writeLog(kv, td.username, approve ? 'approve_upgrade' : 'reject_upgrade', { target: username });
+    return ok({}, approve ? `已批准 ${username} 升级为专业版` : `已拒绝 ${username} 的升级申请`);
   }
 
   // GET /api/admin/stats
@@ -149,7 +203,7 @@ export async function onRequest(context) {
     if (!isSuperadmin) return err('权限不足', 403);
     const targetUser = url.searchParams.get('username') || '';
     const prefix = targetUser ? `log:${targetUser}:` : 'log:';
-    const limit = parseInt(url.searchParams.get('limit') || '100');
+    const limit = parseInt(url.searchParams.get('limit') || '500');
     const result = await kv.list({ prefix, limit });
     const logs = [];
     for (const key of result.keys) {
@@ -157,71 +211,131 @@ export async function onRequest(context) {
       if (raw) logs.push(JSON.parse(raw));
     }
     logs.sort((a, b) => b.timestamp - a.timestamp);
-    return ok({ logs, total: logs.length });
-  }
 
-  // GET /api/admin/upgrade-reqs — 获取所有升级申请
-  if (path.endsWith('/upgrade-reqs') && request.method === 'GET') {
-    if (!isAdmin) return err('权限不足', 403);
-    const result = await kv.list({ prefix: 'upgrade_req:' });
-    const reqs = [];
-    for (const key of result.keys) {
-      const raw = await kv.get(key.name);
-      if (raw) reqs.push(JSON.parse(raw));
-    }
-    reqs.sort((a, b) => b.requestedAt - a.requestedAt);
-    return ok({ reqs });
-  }
+    // 聚合分析
+    const byUser = {};
+    const actionCount = {};
+    const backtestStats = { count: 0, avgRoi: 0, avgRtp: 0, avgWinRate: 0, modelTypes: {}, betModes: {} };
+    const aiStats = { count: 0, quadrants: {}, withBacktest: 0, withInference: 0 };
+    const tabDuration = {}; // tab -> total seconds
+    const uploadCount = {};
+    let totalOnlineSec = 0;
 
-  // POST /api/admin/upgrade-reqs/submit — 用户提交升级申请
-  if (path.endsWith('/upgrade-reqs/submit') && request.method === 'POST') {
-    const username = td.username;
-    const existing = await kv.get(`upgrade_req:${username}`);
-    if (existing) {
-      const ex = JSON.parse(existing);
-      if (ex.status === 'pending') return err('您已提交过申请，请等待审批');
-    }
-    const req = { username, requestedAt: Date.now(), status: 'pending', processedAt: null, processedBy: null };
-    await kv.put(`upgrade_req:${username}`, JSON.stringify(req));
-    await writeLog(kv, username, 'request_upgrade', {});
-    return ok({}, '升级申请已提交');
-  }
+    for (const log of logs) {
+      const u = log.username || 'unknown';
+      if (!byUser[u]) byUser[u] = { logs: 0, backtests: 0, aiReports: 0, tabVisits: {}, onlineSec: 0 };
+      byUser[u].logs++;
 
-  // POST /api/admin/upgrade-reqs/process — 管理员审批
-  if (path.endsWith('/upgrade-reqs/process') && request.method === 'POST') {
-    if (!isAdmin) return err('权限不足', 403);
-    let body; try { body = await request.json(); } catch { return err('Invalid JSON'); }
-    const { username, approve } = body;
-    if (!username) return err('请指定用户名');
-    const raw = await kv.get(`upgrade_req:${username}`);
-    if (!raw) return err('申请不存在');
-    const req = JSON.parse(raw);
-    req.status = approve ? 'approved' : 'rejected';
-    req.processedAt = Date.now();
-    req.processedBy = td.username;
-    await kv.put(`upgrade_req:${username}`, JSON.stringify(req));
-    if (approve) {
-      const uraw = await kv.get(`user:${username}`);
-      if (uraw) {
-        const u = JSON.parse(uraw);
-        u.role = 'professional';
-        await kv.put(`user:${username}`, JSON.stringify(u));
-        // 使该用户的 token 失效（下次登录时重新获取新角色）
-        const tokenList = await kv.list({ prefix: 'token:' });
-        for (const tk of tokenList.keys) {
-          const traw = await kv.get(tk.name);
-          if (traw) {
-            const td2 = JSON.parse(traw);
-            if (td2.username === username) {
-              td2.role = 'professional';
-              await kv.put(tk.name, JSON.stringify(td2));
-            }
-          }
-        }
+      const act = log.action || '';
+      actionCount[act] = (actionCount[act] || 0) + 1;
+
+      if (act === '回测完成' && log.detail) {
+        const d = log.detail;
+        backtestStats.count++;
+        byUser[u].backtests++;
+        backtestStats.avgRoi += parseFloat(d.roi || 0);
+        backtestStats.avgRtp += parseFloat(d.rtp || 0);
+        backtestStats.avgWinRate += parseFloat(d.winRate || 0);
+        if (d.modelType) backtestStats.modelTypes[d.modelType] = (backtestStats.modelTypes[d.modelType] || 0) + 1;
+        if (d.betMode) backtestStats.betModes[d.betMode] = (backtestStats.betModes[d.betMode] || 0) + 1;
       }
+
+      if (act === 'AI报告生成' && log.detail) {
+        const d = log.detail;
+        aiStats.count++;
+        byUser[u].aiReports++;
+        if (d.quadrant) aiStats.quadrants[d.quadrant] = (aiStats.quadrants[d.quadrant] || 0) + 1;
+        if (d.hasBacktest) aiStats.withBacktest++;
+        if (d.hasInference) aiStats.withInference++;
+      }
+
+      if (act === 'Tab停留时长' && log.detail) {
+        const tab = log.detail.tab || '';
+        const sec = parseInt(log.detail.durationSec || 0);
+        tabDuration[tab] = (tabDuration[tab] || 0) + sec;
+        if (byUser[u]) byUser[u].onlineSec += sec;
+      }
+
+      if (act === '在线时长' && log.detail) {
+        const sec = parseInt(log.detail.durationSec || 0);
+        totalOnlineSec += sec;
+        if (byUser[u]) byUser[u].onlineSec += sec;
+      }
+
+      if (act.startsWith('访问功能页:') && log.detail) {
+        const tab = act.replace('访问功能页: ', '');
+        byUser[u].tabVisits[tab] = (byUser[u].tabVisits[tab] || 0) + 1;
+      }
+
+      if (act === '上传数据文件') byUser[u].uploads = (byUser[u].uploads || 0) + 1;
     }
-    await writeLog(kv, td.username, approve ? 'approve_upgrade' : 'reject_upgrade', { target: username });
-    return ok({}, approve ? '已批准升级' : '已拒绝申请');
+
+    if (backtestStats.count > 0) {
+      backtestStats.avgRoi = (backtestStats.avgRoi / backtestStats.count).toFixed(2);
+      backtestStats.avgRtp = (backtestStats.avgRtp / backtestStats.count).toFixed(1);
+      backtestStats.avgWinRate = (backtestStats.avgWinRate / backtestStats.count).toFixed(2);
+    }
+
+    return ok({ logs, total: logs.length, analysis: { byUser, actionCount, backtestStats, aiStats, tabDuration, totalOnlineSec } });
+  }
+
+  // POST /api/admin/record/backtest — 存回测明细到KV
+  if (path.endsWith('/record/backtest') && request.method === 'POST') {
+    const username = td.username;
+    let body; try { body = await request.json(); } catch { return err('Invalid JSON'); }
+    const ts = Date.now();
+    const key = `bt_rec:${username}:${ts}`;
+    await kv.put(key, JSON.stringify({
+      username,
+      timestamp: ts,
+      date: new Date(ts).toISOString(),
+      ...body
+    }), { expirationTtl: 60 * 60 * 24 * 180 }); // 保留180天
+    return ok({}, 'OK');
+  }
+
+  // POST /api/admin/record/ai — 存AI报告明细到KV
+  if (path.endsWith('/record/ai') && request.method === 'POST') {
+    const username = td.username;
+    let body; try { body = await request.json(); } catch { return err('Invalid JSON'); }
+    const ts = Date.now();
+    const key = `ai_rec:${username}:${ts}`;
+    // content单独存（可能很大），meta分开存
+    const { content, ...meta } = body;
+    await kv.put(key, JSON.stringify({ username, timestamp: ts, date: new Date(ts).toISOString(), ...meta }), { expirationTtl: 60 * 60 * 24 * 180 });
+    if (content) {
+      await kv.put(`${key}:content`, content, { expirationTtl: 60 * 60 * 24 * 180 });
+    }
+    return ok({ key }, 'OK');
+  }
+
+  // GET /api/admin/record/list — 管理员查看明细列表
+  if (path.endsWith('/record/list') && request.method === 'GET') {
+    if (!isSuperadmin) return err('权限不足', 403);
+    const type = url.searchParams.get('type') || 'backtest'; // backtest | ai
+    const targetUser = url.searchParams.get('username') || '';
+    const limit = parseInt(url.searchParams.get('limit') || '100');
+    const prefix = type === 'ai'
+      ? (targetUser ? `ai_rec:${targetUser}:` : 'ai_rec:')
+      : (targetUser ? `bt_rec:${targetUser}:` : 'bt_rec:');
+    const result = await kv.list({ prefix, limit });
+    const records = [];
+    for (const k of result.keys) {
+      const raw = await kv.get(k.name);
+      if (raw) records.push(JSON.parse(raw));
+    }
+    records.sort((a, b) => b.timestamp - a.timestamp);
+    return ok({ records, total: records.length });
+  }
+
+  // GET /api/admin/record/ai-content — 管理员查看AI报告正文
+  if (path.endsWith('/record/ai-content') && request.method === 'GET') {
+    if (!isSuperadmin) return err('权限不足', 403);
+    const key = url.searchParams.get('key');
+    if (!key || !key.startsWith('ai_rec:')) return err('无效的key');
+    const content = await kv.get(`${key}:content`);
+    if (!content) return err('报告内容不存在或已过期');
+    return ok({ content });
   }
 
   return err('Not Found', 404);
