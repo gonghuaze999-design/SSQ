@@ -1,5 +1,4 @@
 {
-  "buildCommand": "",
-  "buildOutputDir": "public",
-  "deploymentEnvironment": "production"
+  "buildCommand": "echo 'Static site, no build needed'",
+  "buildOutputDir": "public"
 }
