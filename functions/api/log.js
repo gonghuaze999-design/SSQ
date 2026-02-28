@@ -23,7 +23,7 @@ export async function onRequest(context) {
   if (request.method === 'OPTIONS') return opts();
   if (request.method !== 'POST') return err('Method not allowed', 405);
 
-  const kv = env.SSQ_KV;
+  const kv = SSQ_KV;
   if (!kv) return err('KV Storage not configured', 500);
 
   const td = await getTokenData(kv, request);
