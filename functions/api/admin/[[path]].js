@@ -32,14 +32,19 @@ async function getTokenData(kv, request) {
 
 async function listUsers(kv) {
   const result = await kv.list({ prefix: 'user:' });
+  const keys = result.keys.map(k => k.name);
   const users = [];
-  for (const key of result.keys) {
-    const raw = await kv.get(key.name);
-    if (raw) {
-      const u = JSON.parse(raw);
-      delete u.password;
-      users.push({ username: key.name.replace('user:', ''), ...u });
-    }
+  const batchSize = 20;
+  for (let i = 0; i < keys.length; i += batchSize) {
+    const batch = keys.slice(i, i + batchSize);
+    const raws = await Promise.all(batch.map(k => kv.get(k)));
+    raws.forEach((raw, j) => {
+      if (raw) {
+        const u = JSON.parse(raw);
+        delete u.password;
+        users.push({ username: keys[i + j].replace('user:', ''), ...u });
+      }
+    });
   }
   return users;
 }
@@ -141,11 +146,9 @@ export async function onRequest(context) {
   if (path.endsWith('/upgrade/list') && request.method === 'GET') {
     if (!isSuperadmin) return err('权限不足', 403);
     const result = await kv.list({ prefix: 'upgrade:' });
-    const reqs = [];
-    for (const key of result.keys) {
-      const raw = await kv.get(key.name);
-      if (raw) reqs.push(JSON.parse(raw));
-    }
+    const keys = result.keys.map(k => k.name);
+    const raws = await Promise.all(keys.map(k => kv.get(k)));
+    const reqs = raws.filter(Boolean).map(r => JSON.parse(r));
     reqs.sort((a, b) => b.requestedAt - a.requestedAt);
     return ok({ reqs });
   }
@@ -179,15 +182,15 @@ export async function onRequest(context) {
   // GET /api/admin/stats
   if (path.endsWith('/stats') && request.method === 'GET') {
     if (!isAdmin) return err('权限不足', 403);
-    const statsArr = [];
     const now = new Date();
-    for (let i = 29; i >= 0; i--) {
-      const d = new Date(now);
-      d.setDate(d.getDate() - i);
-      const dateStr = d.toISOString().slice(0, 10);
-      const raw = await kv.get(`stats:daily:${dateStr}`);
-      statsArr.push({ date: dateStr, ...(raw ? JSON.parse(raw) : { login: 0, calc: 0, total: 0 }) });
-    }
+    // 并发读取30天数据
+    const dateStrs = Array.from({length:30}, (_,i) => {
+      const d = new Date(now); d.setDate(d.getDate() - (29-i));
+      return d.toISOString().slice(0, 10);
+    });
+    const raws = await Promise.all(dateStrs.map(ds => kv.get(`stats:daily:${ds}`)));
+    const statsArr = dateStrs.map((ds, i) => ({ date: ds, ...(raws[i] ? JSON.parse(raws[i]) : { login: 0, calc: 0, total: 0 }) }));
+
     const users = await listUsers(kv);
     const roleCount = { basic: 0, professional: 0, superadmin: 0 };
     const statusCount = { active: 0, pending: 0, disabled: 0 };
@@ -203,12 +206,17 @@ export async function onRequest(context) {
     if (!isSuperadmin) return err('权限不足', 403);
     const targetUser = url.searchParams.get('username') || '';
     const prefix = targetUser ? `log:${targetUser}:` : 'log:';
-    const limit = parseInt(url.searchParams.get('limit') || '500');
+    const limit = parseInt(url.searchParams.get('limit') || '100');
     const result = await kv.list({ prefix, limit });
+
+    // 并发读取，最多20个并发
+    const keys = result.keys.map(k => k.name);
     const logs = [];
-    for (const key of result.keys) {
-      const raw = await kv.get(key.name);
-      if (raw) logs.push(JSON.parse(raw));
+    const batchSize = 20;
+    for (let i = 0; i < keys.length; i += batchSize) {
+      const batch = keys.slice(i, i + batchSize);
+      const raws = await Promise.all(batch.map(k => kv.get(k)));
+      raws.forEach(raw => { if (raw) logs.push(JSON.parse(raw)); });
     }
     logs.sort((a, b) => b.timestamp - a.timestamp);
 
