@@ -61,7 +61,12 @@ async function writeLog(kv, username, action, detail = {}) {
 export async function onRequest(context) {
   const { request, env } = context;
   if (request.method === 'OPTIONS') return opts();
-  if (request.method !== 'POST') return err('Method not allowed', 405);
+  if (request.method === 'GET') {
+  const envKeys = Object.keys(env || {});
+  return new Response(JSON.stringify({ env_keys: envKeys, has_SSQ_KV: !!env.SSQ_KV }), 
+    { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }});
+}
+if (request.method !== 'POST') return err('Method not allowed', 405);
 
   const kv = env.SSQ_KV;
   if (!kv) return err('KV Storage not configured', 500);
