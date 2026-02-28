@@ -10,7 +10,7 @@ export async function onRequest(context) {
   const { request, env } = context;
   if (request.method === 'OPTIONS') return opts();
 
-  const kv = env.SSQ_KV;
+  const kv = SSQ_KV;
   const auth = request.headers.get('Authorization') || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
 
