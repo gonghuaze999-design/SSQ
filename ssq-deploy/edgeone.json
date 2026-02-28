@@ -1,0 +1,5 @@
+{
+  "buildCommand": "",
+  "buildOutputDir": "public",
+  "deploymentEnvironment": "production"
+}
