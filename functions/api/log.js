@@ -1,41 +1,51 @@
-/**
- * POST /api/log
- * 前端记录用户操作（如：预测计算、功能使用等）
- * Body: { action, detail? }
- */
+// POST /api/log - 前端记录用户操作
 
-import {
-  successResponse, errorResponse, handleOptions,
-  extractToken, verifyToken, writeLog
-} from '../_utils.js';
+function jsonRes(data, status = 200) {
+  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization' } });
+}
+const ok = (data = {}, msg = 'success') => jsonRes({ code: 0, message: msg, data });
+const err = (msg, status = 400) => jsonRes({ code: -1, message: msg, data: null }, status);
+const opts = () => new Response(null, { status: 204, headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization' } });
+
+async function getTokenData(kv, request) {
+  const auth = request.headers.get('Authorization') || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return null;
+  const raw = await kv.get(`token:${token}`);
+  if (!raw) return null;
+  const td = JSON.parse(raw);
+  if (Date.now() > td.expires) { await kv.delete(`token:${token}`); return null; }
+  return td;
+}
 
 export async function onRequest(context) {
   const { request, env } = context;
-
-  if (request.method === 'OPTIONS') return handleOptions();
-  if (request.method !== 'POST') return errorResponse('Method not allowed', 405);
+  if (request.method === 'OPTIONS') return opts();
+  if (request.method !== 'POST') return err('Method not allowed', 405);
 
   const kv = env.SSQ_KV;
-  const token = extractToken(request);
-  const tokenData = await verifyToken(kv, token);
+  if (!kv) return err('KV Storage not configured', 500);
 
-  if (!tokenData) {
-    return errorResponse('未登录', 401);
-  }
+  const td = await getTokenData(kv, request);
+  if (!td) return err('未登录', 401);
 
-  let body;
-  try { body = await request.json(); } catch { return errorResponse('Invalid JSON'); }
-
+  let body; try { body = await request.json(); } catch { return err('Invalid JSON'); }
   const { action, detail = {} } = body;
-  if (!action) return errorResponse('action 不能为空');
+  if (!action) return err('action 不能为空');
 
-  // 允许的操作类型白名单
-  const allowedActions = ['calculate', 'view_result', 'export', 'change_settings', 'view_history'];
-  if (!allowedActions.includes(action)) {
-    return errorResponse('无效的操作类型');
-  }
+  const allowed = ['calculate', 'view_result', 'export', 'change_settings', 'view_history'];
+  if (!allowed.includes(action)) return err('无效的操作类型');
 
-  await writeLog(kv, tokenData.username, action, detail);
+  const ts = Date.now();
+  await kv.put(`log:${td.username}:${ts}`, JSON.stringify({ username: td.username, action, detail, timestamp: ts, date: new Date(ts).toISOString() }));
 
-  return successResponse({}, 'OK');
+  const today = new Date().toISOString().slice(0, 10);
+  const statsKey = `stats:daily:${today}`;
+  const rawStats = await kv.get(statsKey);
+  const s = rawStats ? JSON.parse(rawStats) : { login: 0, calc: 0, total: 0 };
+  s.total += 1;
+  if (action === 'calculate') s.calc += 1;
+  await kv.put(statsKey, JSON.stringify(s));
+
+  return ok({}, 'OK');
 }
