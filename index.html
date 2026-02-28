@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>SSQ 量化预测系统 v1.5.6-autopilot-lstm</title>
+<title>SSQ 量化预测系统 v1.5.7-almost</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style id="tw-fallback">
 
@@ -5339,10 +5339,13 @@ hr{border:none;border-top:1px dashed #e2e8f0;margin:28px 0}
   <a href="#sec-validate" onclick="goto('sec-validate')">② 数据契约</a>
   <a href="#sec-feature" onclick="goto('sec-feature')">③ 特征实验</a>
   <a href="#sec-model" onclick="goto('sec-model')">④ 模型实验</a>
+  <a href="#sec-strategy-plans" onclick="goto('sec-strategy-plans')" style="padding-left:32px;font-size:11px">↳ 策略三方案解读</a>
   <a href="#sec-backtest" onclick="goto('sec-backtest')">⑤ 历史回测</a>
   <a href="#sec-dashboard" onclick="goto('sec-dashboard')">⑥ 量化看板</a>
+  <a href="#sec-decision-panel" onclick="goto('sec-decision-panel')" style="padding-left:32px;font-size:11px">↳ 投注决策面板</a>
   <a href="#sec-stat" onclick="goto('sec-stat')">⑦ 统计检验</a>
   <a href="#sec-decision" onclick="goto('sec-decision')">⑧ 智能决策</a>
+  <a href="#sec-decision-flow" onclick="goto('sec-decision-flow')" style="background:#f5f3ff;border-left-color:#7c3aed;color:#6d28d9;font-weight:700">🎯 投注决策完整流程</a>
   <a href="#sec-autopilot" onclick="goto('sec-autopilot')">🤖 AutoPilot 概览 <span class="badge badge-new">NEW</span></a>
   <a href="#sec-autopilot-op" onclick="goto('sec-autopilot-op')" style="padding-left:32px;font-size:11px">↳ 正规操作方法</a>
   <a href="#sec-autopilot-charts" onclick="goto('sec-autopilot-charts')" style="padding-left:32px;font-size:11px">↳ 图表与指标解读</a>
@@ -5430,12 +5433,27 @@ hr{border:none;border-top:1px dashed #e2e8f0;margin:28px 0}
 <div class="step"><div class="step-num">2</div><div>配置树参数（树数量/学习率/最大深度），点击「🌲 开始训练XGBoost」</div></div>
 <div class="step"><div class="step-num">3</div><div>训练完成后自动激活为当前模型，可直接推理和回测</div></div>
 <h3>推理与策略优化</h3>
-<p>模型就绪后，点击「⚡ 运行推理」获取红蓝球概率分布。然后在「策略优化」区调整约束条件，点击「遗传算法优化」生成多样化号码组合：</p>
-<ul>
-<li><strong>和值约束</strong>：限定6红球之和的范围（理论均值102）</li>
-<li><strong>奇偶比</strong>：控制奇偶数比例（Any/3:3/4:2）</li>
-<li><strong>冷门偏好系数</strong>：0%=纯概率优先，100%=纯冷门优先，推荐30-50%</li>
-</ul>
+<p>模型就绪后，点击「⚡ 运行推理」获取红蓝球概率分布（含MC Dropout不确定性估计）。然后在「策略优化」区设置约束，点击「🧬 生成策略组合（多方案）」触发遗传算法优化。</p>
+<h4>约束条件说明</h4>
+<table>
+<tr><th>约束项</th><th>作用</th><th>推荐设置</th></tr>
+<tr><td>和值下/上限</td><td>限定6个红球之和的范围（理论均值≈102，历史分布集中在60-160）</td><td>下限70，上限140</td></tr>
+<tr><td>奇偶比</td><td>控制奇数/偶数红球的比例</td><td>Any（不限制）；偏好均匀时选3:3</td></tr>
+<tr><td>冷门偏好系数</td><td>0%=完全按模型概率排序；100%=完全按历史冷门（低频）排序；中间值=两者加权混合</td><td>30-50%，兼顾概率与冷门分散</td></tr>
+<tr><td>启用约束过滤</td><td>勾选后GA种群中不满足和值/奇偶约束的个体会被剔除</td><td>建议勾选，提升号码质量</td></tr>
+</table>
+
+<h3 id="sec-strategy-plans">策略优化三方案解读</h3>
+<p>GA完成后，右侧展示「保守 / 均衡 / 激进」三个方案标签。<strong>三种方案的本质区别只有一件事：每期买几注，以及号码如何分配。</strong>号码本身全部来自GA生成的同一批候选，三种方案拿的是其中得分排名前1/3/6名。</p>
+<table>
+<tr><th>方案</th><th>每期注数</th><th>每期成本</th><th>红球来源</th><th>蓝球</th></tr>
+<tr><td><strong class="tag tag-b">保守</strong></td><td>1注</td><td>¥2</td><td>GA得分排名第1的组合</td><td>最高概率蓝球×1</td></tr>
+<tr><td><strong class="tag" style="background:#dbeafe;color:#4338ca">均衡</strong></td><td>3注</td><td>¥6</td><td>GA得分排名第1、2、3的组合</td><td>最高概率蓝球×1（三注共用同一蓝球）</td></tr>
+<tr><td><strong class="tag tag-r">激进</strong></td><td>6注</td><td>¥12</td><td>GA得分排名前6的组合</td><td>从Top3蓝球中随机分配，同时覆盖3个蓝球候选</td></tr>
+</table>
+<p><strong>激进方案的特殊之处</strong>：蓝球不是固定一个，而是从模型概率最高的3个蓝球中分配给6组红球，相当于一次性覆盖多个蓝球候选，提升蓝球命中面，但成本增加到¥12。</p>
+<div class="card card-blue"><strong>💡 如何选择方案？</strong>不要单独看这里，应配合「量化看板 → 投注决策面板」的财务测算一起使用：决策面板告诉你<strong>每期适合投几注</strong>（凯利公式建议），再回到这里选择对应注数的方案拿走号码。详见本手册「<a onclick="goto('sec-decision-flow')" style="color:#4f46e5;cursor:pointer">投注决策完整流程</a>」。</div>
+<div class="card card-amber"><strong>⚠ 注意</strong>：激进方案每次生成的蓝球配对结果可能略有不同（随机分配），如需稳定结果可多生成几次取共识。</div>
 
 <hr>
 <h2 id="sec-backtest">⑤ 历史回测</h2>
@@ -5461,13 +5479,61 @@ hr{border:none;border-top:1px dashed #e2e8f0;margin:28px 0}
 
 <hr>
 <h2 id="sec-dashboard">⑥ 量化看板</h2>
-<p>基于训练集数据的统计可视化面板：</p>
+<p>基于训练集数据的统计可视化面板，包含两大部分：统计图表和投注决策面板。</p>
+<h3>统计图表</h3>
 <ul>
 <li><strong>红球热力图</strong>：1-33号码历史出现频次热图</li>
 <li><strong>蓝球分布</strong>：16个蓝球出现频次柱状图</li>
 <li><strong>和值分布</strong>：近期红球和值走势与历史均值对比</li>
-<li><strong>凯利公式</strong>：基于回测RTP和平均奖金池，估算最优投注比例</li>
 </ul>
+
+<h3 id="sec-decision-panel">投注决策面板 — 三方案财务测算</h3>
+<p>这是量化看板最重要的功能，回答的问题是：<strong>「我每期应该投几注？坚持N期总成本多少？期间能中奖的概率是多少？」</strong></p>
+<p>面板会自动检测是否已完成历史回测，并显示数据来源标志：</p>
+<ul>
+<li><span style="background:#dcfce7;color:#166534;padding:1px 6px;border-radius:4px;font-size:12px;font-weight:700">✓ 已联动回测数据</span>：使用你的模型在测试集上的实测中奖率和平均奖金，结果最贴近实际</li>
+<li><span style="background:#fef9c3;color:#854d0e;padding:1px 6px;border-radius:4px;font-size:12px;font-weight:700">使用理论概率</span>：未运行回测，使用双色球理论概率（六等奖≈1/21），误差较大</li>
+</ul>
+<div class="card card-amber"><strong>⚠ 强烈建议先运行历史回测再看此面板</strong>，否则测算依据是纯理论值，对你的模型没有针对性。</div>
+
+<h4>输入参数</h4>
+<table>
+<tr><th>参数</th><th>说明</th><th>建议</th></tr>
+<tr><td>每期可用资金 (¥)</td><td>你愿意每期最多花多少钱</td><td>设置为你能承受连续亏损的金额，不是"想赢多少"</td></tr>
+<tr><td>计划持续期数</td><td>计划连续购买多少期</td><td>至少20期，才能观察到有统计意义的结果</td></tr>
+<tr><td>均衡方案每期注数</td><td>均衡方案的基准注数，激进=此值×2（上限12）</td><td>初始设3，参考凯利公式建议后调整</td></tr>
+</table>
+
+<h4>三方案含义与用途</h4>
+<p>三种方案使用完全相同的期望值数学，区别只是规模不同：</p>
+<table>
+<tr><th>方案</th><th>每期注数</th><th>核心用途</th></tr>
+<tr><td><strong>保守</strong></td><td>固定1注（¥2/期）</td><td>最低成本基准线，用于对比"什么都不省"的最小参与代价</td></tr>
+<tr><td><strong>均衡</strong></td><td>你输入的值（默认3注）</td><td>你认为合理的参与规模，主要参考方案</td></tr>
+<tr><td><strong>激进</strong></td><td>均衡值×2（最多12注）</td><td>扩大覆盖面的版本，了解加注后的成本/概率变化</td></tr>
+</table>
+
+<h4>三方案各项指标解读</h4>
+<table>
+<tr><th>指标</th><th>含义</th><th>注意事项</th></tr>
+<tr><td>每期成本</td><td>按注数×2元计算</td><td>—</td></tr>
+<tr><td>总成本</td><td>每期成本 × 计划期数</td><td>这是你需要准备的总预算上限</td></tr>
+<tr><td>期望获奖</td><td>实测平均奖金 × 实测中奖率 × 期数 × 注数</td><td>彩票是负期望游戏，期望获奖通常低于总成本</td></tr>
+<tr><td>期望ROI</td><td>(期望获奖-总成本)/总成本×100%</td><td><strong>三种方案ROI完全相同</strong>——这是正确的数学结论，多投注不会提升期望回报率，只会等比例放大成本和期望奖金</td></tr>
+<tr><td>每期中奖率</td><td>每期至少1注命中任意奖级的概率（考虑多注覆盖）</td><td>注数越多，每期中奖率越高；单注约4.6%，3注≈13%，6注≈24%</td></tr>
+<tr><td>N期至少中一次</td><td>坚持N期，至少获得一次任意奖级的概率</td><td>坚持越久，累计中奖概率越高；用于估算"熬多久能出货"</td></tr>
+</table>
+<div class="card card-red"><strong>🔴 最重要的认知</strong>：三种方案期望ROI相同，均为负值（彩票的长期期望收益为负）。选择方案的依据不是"哪个赚得多"（数学上一样），而是"我能承受多大的成本风险"以及"我需要多高的单期中奖频率来维持参与积极性"。</div>
+
+<h4>凯利公式建议</h4>
+<p>面板顶部的凯利公式模块基于实测RTP自动估算理论最优注数，并给出奖池状态判断。这是一个辅助参考而非严格指令——彩票是负期望游戏，严格执行凯利公式的结论通常是"不参与"。实际参考意义在于：</p>
+<ul>
+<li>凯利注数较高（如≥3注）且奖池处于"大奖池"状态 → 当前博弈环境相对有利，可以按均衡方案参与</li>
+<li>凯利注数极低（如1注）且奖池普通 → 当前期望值较低，保守方案（1注）或观望更合理</li>
+</ul>
+
+<h4>生存分析表</h4>
+<p>面板下方的生存分析表显示：在你设定的注数下，连续投注5/10/20/30/50/100期，至少中一次各级别奖的概率。颜色越绿说明概率越高。用于回答"我打算投多久，期间能不能见到奖金"这个心理账户问题。</p>
 
 <hr>
 <h2 id="sec-stat">⑦ 统计检验</h2>
@@ -5482,7 +5548,7 @@ hr{border:none;border-top:1px dashed #e2e8f0;margin:28px 0}
 
 <hr>
 <h2 id="sec-decision">⑧ 智能决策 <span class="badge badge-new">AI驱动</span></h2>
-<p>整合所有数据源，调用 Gemini 2.5 Flash 生成专业决策报告。</p>
+<p>整合所有数据源，调用 Gemini 2.5 Flash 生成专业决策报告。同时包含基于博弈矩阵的投注方案自动生成功能。</p>
 <h3>配置 Gemini API Key</h3>
 <div class="step"><div class="step-num">1</div><div>访问 <code>aistudio.google.com/apikey</code>，登录Google账号</div></div>
 <div class="step"><div class="step-num">2</div><div>点击 Create API Key，复制生成的Key（以 AIzaSy 开头）</div></div>
@@ -5498,13 +5564,24 @@ hr{border:none;border-top:1px dashed #e2e8f0;margin:28px 0}
 <tr><td>六、下期重点观察指标</td><td>3个具体数据阈值</td></tr>
 </table>
 <h3>四象限博弈矩阵</h3>
+<p>系统根据当期奖池大小和号码拥挤度（实际中奖注数/期望中奖注数）自动判断所处象限，并为每个象限推荐不同的投注类型：</p>
 <table>
-<tr><th>象限</th><th>条件</th><th>策略</th><th>预算系数</th></tr>
-<tr><td>⚡ Q1 最佳出击</td><td>高奖池 × 冷门格局</td><td>激进胆拖</td><td>×2.0</td></tr>
-<tr><td>⚠️ Q2 谨慎参与</td><td>高奖池 × 热门集中</td><td>保守复式</td><td>×0.5</td></tr>
-<tr><td>🎯 Q3 轻仓守候</td><td>普通奖期 × 冷门</td><td>单式保守</td><td>×1.0</td></tr>
-<tr><td>🚫 Q4 最小参与</td><td>普通奖期 × 热门</td><td>最小或跳过</td><td>×0.25</td></tr>
+<tr><th>象限</th><th>条件</th><th>策略</th><th>预算系数</th><th>逻辑</th></tr>
+<tr><td>⚡ Q1 最佳出击</td><td>高奖池 × 冷门格局（拥挤度低）</td><td>激进胆拖</td><td>×2.0</td><td>奖金大且中奖时分奖人少，是最有利的博弈时机</td></tr>
+<tr><td>⚠️ Q2 谨慎参与</td><td>高奖池 × 热门集中（拥挤度高）</td><td>保守复式</td><td>×0.5</td><td>奖金大但中奖时分奖人多，奖金被稀释，控制投入</td></tr>
+<tr><td>🎯 Q3 轻仓守候</td><td>普通奖期 × 冷门</td><td>单式保守</td><td>×1.0</td><td>奖金普通，维持低成本参与即可</td></tr>
+<tr><td>🚫 Q4 最小参与</td><td>普通奖期 × 热门</td><td>最小或跳过</td><td>×0.25</td><td>奖金普通且分奖人多，性价比最低，观望为主</td></tr>
 </table>
+
+<h3>博弈矩阵自动生成投注方案</h3>
+<p>点击「⚡ 生成投注决策」后，系统根据当前象限自动推荐具体号码方案（需要已运行推理才有概率数据）：</p>
+<table>
+<tr><th>象限触发</th><th>生成方案类型</th><th>方案说明</th></tr>
+<tr><td>Q1（高奖池+冷门）</td><td>胆拖方案 + 可选双蓝</td><td>2个胆码（模型最高置信度）+ N个拖码（次高概率区），追求一注命中奖金最大化；若预算充足还会生成双蓝版本</td></tr>
+<tr><td>Q2（高奖池+热门）</td><td>复式方案</td><td>Top-7红球复式（7注），系统化覆盖高概率区，控制成本同时保留冲奖机会</td></tr>
+<tr><td>Q3/Q4（普通奖期）</td><td>单式保底</td><td>Top-6红球+最高概率蓝球，最低成本维持参与</td></tr>
+</table>
+<div class="card card-blue"><strong>💡 与模型实验三方案的区别</strong>：模型实验的三方案（保守/均衡/激进）是基于GA优化的号码清单，你自己选买几注；智能决策的方案是系统根据博弈象限自动推荐的投注类型，已经内置了投注模式决策（胆拖/复式/单式）。两者的号码都来自模型推理概率，是互补而非替代关系。</div>
 <h3>报告历史管理</h3>
 <p>每次生成的报告自动保存（最多50条），支持：</p>
 <ul>
@@ -5514,6 +5591,84 @@ hr{border:none;border-top:1px dashed #e2e8f0;margin:28px 0}
 <li>🔍 点击「查看」在主面板预览历史报告</li>
 </ul>
 <div class="card card-red"><strong>🔴 Token截断说明</strong>：如报告末尾出现「⚠️ 注意：报告因Token上限被截断」提示，请点击重新生成。v1.5.2已将Token上限从4000提升至8192，正常情况下不会截断。</div>
+
+<hr>
+<h2 id="sec-decision-flow">🎯 投注决策完整流程</h2>
+<p>本章节把分散在各页面的功能串联成一条完整的决策链路。以下是从数据到实际投注的标准操作流程。</p>
+
+<div class="card card-purple" style="margin-bottom:20px">
+<strong>两处「保守/均衡/激进」三方案的核心区别</strong><br><br>
+系统中有<strong>两处</strong>三方案，名字相同但用途完全不同，必须分开理解：<br><br>
+<strong>① 量化看板 → 投注决策面板</strong>（财务测算）：告诉你<em>每期应该投几注、总预算多少、坚持N期的中奖概率</em>。输出是数字建议，帮你决定投注规模。<br><br>
+<strong>② 模型实验 → 策略优化</strong>（号码清单）：基于GA遗传算法，给出具体的红蓝球号码组合。保守=1注号码，均衡=3注号码，激进=6注号码。<br><br>
+正确的使用顺序：先看①决定买几注 → 再看②拿对应注数的号码去购买。
+</div>
+
+<h3>标准决策链路（逐步操作）</h3>
+
+<div class="step"><div class="step-num">1</div><div>
+<strong>历史回测</strong>（⑤ 历史回测页）<br>
+先跑一次回测，获取你的模型在测试集上的实测中奖率和平均奖金。这是后续所有概率计算的数据基础。<br>
+<span style="color:#64748b;font-size:12px">→ 完成后回测数据会自动联动到量化看板决策面板（右上角出现绿色「✓ 已联动回测数据」标志）</span>
+</div></div>
+
+<div class="step"><div class="step-num">2</div><div>
+<strong>决定投注规模</strong>（⑥ 量化看板 → 投注决策面板）<br>
+输入：每期可用资金、计划持续期数。<br>
+查看凯利公式建议注数和三方案对比表，重点关注：<br>
+• 你能承受的总成本上限（总成本一列）<br>
+• 你期望的单期中奖频率（每期中奖率一列）<br>
+• 坚持你计划期数内至少中一次的概率（生存分析）<br>
+<span style="color:#64748b;font-size:12px">→ 做出决策：本期采用保守(1注)/均衡(N注)/激进(2N注)</span>
+</div></div>
+
+<div class="step"><div class="step-num">3</div><div>
+<strong>判断博弈环境</strong>（⑧ 智能决策页）<br>
+查看当期奖池金额和拥挤度，确认当前处于哪个象限（Q1/Q2/Q3/Q4）。<br>
+• Q1（高奖池+冷门）→ 适合加注，使用胆拖类型<br>
+• Q2（高奖池+热门）→ 减注，使用复式类型<br>
+• Q3（普通+冷门）→ 正常参与<br>
+• Q4（普通+热门）→ 考虑跳过或最小参与<br>
+<span style="color:#64748b;font-size:12px">→ 结合Step 2的预算规模，综合决定本期是否参与以及投注类型</span>
+</div></div>
+
+<div class="step"><div class="step-num">4</div><div>
+<strong>获取具体号码</strong>（④ 模型实验 → 策略优化）<br>
+确认模型已推理（Step 2之前需要先完成），设置约束条件，点击「🧬 生成策略组合」。<br>
+根据Step 2确定的注数选择对应方案：<br>
+<table style="margin:8px 0;font-size:12px">
+<tr><th>Step 2 决策</th><th>Step 4 选择</th><th>实际操作</th></tr>
+<tr><td>1注/期</td><td>保守方案</td><td>拿第1组红球 + 最高概率蓝球</td></tr>
+<tr><td>3注/期</td><td>均衡方案</td><td>拿前3组红球 + 最高概率蓝球</td></tr>
+<tr><td>6注/期</td><td>激进方案</td><td>拿前6组红球 + Top3蓝球各配一个</td></tr>
+</table>
+<span style="color:#64748b;font-size:12px">→ 也可直接使用智能决策页的「⚡ 生成投注决策」，系统会基于博弈象限自动推荐投注类型和号码</span>
+</div></div>
+
+<div class="step"><div class="step-num">5</div><div>
+<strong>AI综合研判（可选）</strong>（⑧ 智能决策页 → AI报告）<br>
+如果配置了Gemini API Key，生成6章节AI报告，重点阅读「四、本期操作结论」和「五、资金管理建议」，与自己的决策做交叉验证。<br>
+<span style="color:#64748b;font-size:12px">→ AI报告注入了历史回测数据、近50期统计、模型推理概率三类数据，综合判断质量优于单一维度</span>
+</div></div>
+
+<h3>各页面数据联动关系</h3>
+<table>
+<tr><th>页面</th><th>输出什么数据</th><th>被哪里使用</th></tr>
+<tr><td>⑤ 历史回测</td><td>实测中奖率、平均奖金、RTP、各等级分布</td><td>量化看板决策面板（概率计算基础）；智能决策AI报告（注入Prompt）</td></tr>
+<tr><td>④ 模型实验（推理）</td><td>红蓝球概率分布、不确定性（MC Dropout方差）</td><td>策略优化GA（号码生成）；智能决策（博弈矩阵方案+AI报告Prompt）</td></tr>
+<tr><td>⑥ 量化看板（决策面板）</td><td>建议注数（凯利公式）、三方案财务数据</td><td>指导用户在模型实验中选择哪个方案拿号码</td></tr>
+<tr><td>⑧ 智能决策（博弈矩阵）</td><td>象限判断、推荐投注类型、具体方案号码</td><td>直接用于投注；或作为模型实验三方案的投注类型决策参考</td></tr>
+</table>
+
+<h3>常见误操作</h3>
+<table>
+<tr><th>误操作</th><th>正确做法</th></tr>
+<tr><td>未跑回测就直接看决策面板</td><td>先跑回测，让决策面板使用实测概率而非理论值</td></tr>
+<tr><td>在模型实验三方案里随便选一个，不管博弈环境</td><td>先在智能决策页看博弈象限，再决定注数，再选对应方案</td></tr>
+<tr><td>看到激进方案ROI和保守方案相同，以为多买没意义</td><td>ROI相同是正确的数学结论。多买的价值在于提高单期中奖频率，降低"一直没中"的心理压力，而非提升期望回报</td></tr>
+<tr><td>Q1最佳出击时不会用胆拖，只用单式</td><td>Q1时应在智能决策页点「⚡ 生成投注决策」，系统会自动生成胆拖方案，比单式更高效覆盖高置信度号码</td></tr>
+<tr><td>AutoPilot找到的最优策略直接用于当期投注</td><td>AutoPilot的超额收益是历史数据，当期是否参与还要结合博弈象限（Step 3）判断</td></tr>
+</table>
 
 <hr>
 <h2 id="sec-autopilot">🤖 AutoPilot <span class="badge badge-new">v1.5.6 新增</span></h2>
@@ -5860,23 +6015,29 @@ async function apWithTimeout(promise, ms=300000){
 }
 
 // ── 动态超时计算：按模型类型 + 参数估算合理上限 ──
-// 逻辑：先估算"正常完成时间"，再乘以安全系数 2.5，最低60秒兜底
+// LSTM 安全系数 4.0（逐期推理tensor开销实测远超估算）
+// XGB  安全系数 2.5
 function apCalcTimeout(exp, dataLen){
   const testLen = Math.floor(dataLen * (1 - (exp.split||0.8)));
   if(exp.modelType === 'lstm'){
-    // LSTM：训练阶段 + 推理阶段
-    // 训练：epochs × 样本数 × 每步耗时基准(~3ms/样本/epoch，浏览器CPU)
+    if(exp.useExternalModel){
+      // 外部模型：只有推理+回测阶段，无训练，逐期推理约30ms/期
+      const inferEstMs = testLen * 30;
+      const btEstMs = testLen * 1;
+      return Math.max(60000, Math.ceil((inferEstMs + btEstMs) * 3.0));
+    }
     const trainSamples = dataLen - testLen;
     const epochs = exp.lstmEpochs || 15;
+    // 训练：epochs × 样本数 × 3ms（浏览器CPU基准）
     const trainEstMs = epochs * trainSamples * 3;
-    // 推理：testLen × 每步耗时(~10ms/步，含tensor创建销毁)
-    const inferEstMs = testLen * 10;
+    // 推理：逐期tensor创建销毁，实测约20-40ms/期；保守取30ms
+    const inferEstMs = testLen * 30;
     // 回测：testLen × 1ms
     const btEstMs = testLen * 1;
     const normalMs = trainEstMs + inferEstMs + btEstMs;
-    return Math.max(60000, Math.ceil(normalMs * 2.5));
+    // 安全系数4.0，最低90秒
+    return Math.max(90000, Math.ceil(normalMs * 4.0));
   } else {
-    // XGB：树数量 × (33+16)棵子树 × 样本数 × 单棵耗时基准(~0.05ms)
     const nTrees = exp.nTrees || 100;
     const trainSamples = dataLen - testLen;
     const trainEstMs = nTrees * 49 * trainSamples * 0.05;
@@ -6273,31 +6434,51 @@ async function apTrainLSTM(trainData, cfg, onProgress){
   return { model, ctx, lookBack };
 }
 
-// ── 纯函数：对测试集做 LSTM 推理 ──
+// ── 纯函数：对测试集做 LSTM 推理（批量模式，减少tensor开销）──
 async function apLSTMInferTest(lstmArtifact, testData, allData){
   const { model, ctx, lookBack } = lstmArtifact;
   const allSorted = [...allData].sort((a,b)=>new Date(a.date)-new Date(b.date));
-  // 为测试集每期获取 lookBack 个历史样本（从全量数据里找）
-  const results = [];
+
+  // 先收集所有有效期的 features，记录映射关系
+  const validItems = [];
   for(const td of testData){
     const idx = allSorted.findIndex(d=>d.issue===td.issue);
-    if(idx < lookBack){ results.push(null); continue; }
+    if(idx < lookBack) continue;
     const win = allSorted.slice(idx-lookBack, idx);
     const features = win.map((d,j)=>encodeFeatures(d, ctx, j>0?win[j-1]:null));
-    const inp = tf.tensor3d([features]);
-    const outs = tf.tidy(()=>{
-      const res = model.apply(inp, {training:false});
-      return Array.isArray(res)?[res[0].clone(), res[1].clone()]:[res.clone(), res.clone()];
-    });
-    const redProbs  = Array.from(await outs[0].data());
-    const blueProbs = Array.from(await outs[1].data());
-    outs[0].dispose(); outs[1].dispose();
-    inp.dispose();
-    await tf.nextFrame();
-    results.push({ issue: td.issue, redProbs, blueProbs,
-      uncertaintyRed:0.02, entropyRed:3.0, riskLevel:'medium' });
+    validItems.push({ issue: td.issue, features });
   }
-  return results.filter(Boolean);
+  if(validItems.length === 0) return [];
+
+  // 分批推理（每批32期），避免一次性tensor过大
+  const BATCH = 32;
+  const results = [];
+  for(let b=0; b<validItems.length; b+=BATCH){
+    const batch = validItems.slice(b, b+BATCH);
+    const batchFeatures = batch.map(it=>it.features);
+    const inp = tf.tensor3d(batchFeatures);
+    const [redT, blueT] = tf.tidy(()=>{
+      const res = model.apply(inp, {training:false});
+      return Array.isArray(res)
+        ? [res[0].clone(), res[1].clone()]
+        : [res.clone(), res.clone()];
+    });
+    const redAll  = Array.from(await redT.data());
+    const blueAll = Array.from(await blueT.data());
+    redT.dispose(); blueT.dispose(); inp.dispose();
+    const redDim  = redAll.length  / batch.length;  // 33
+    const blueDim = blueAll.length / batch.length;   // 16
+    batch.forEach((it, i)=>{
+      results.push({
+        issue: it.issue,
+        redProbs:  Array.from(redAll.slice(i*redDim,   (i+1)*redDim)),
+        blueProbs: Array.from(blueAll.slice(i*blueDim, (i+1)*blueDim)),
+        uncertaintyRed:0.02, entropyRed:3.0, riskLevel:'medium'
+      });
+    });
+    await tf.nextFrame(); // 每批释放一次UI线程
+  }
+  return results;
 }
 
 // ── 内存管理：释放 LSTM 模型（TF.js张量）──
@@ -6370,12 +6551,16 @@ function apGenerateMatrix(cfg){
               }
             } else if(mt === 'lstm'){
               for(const ep of (cfg.lstmEpochs||[15])){
+                // ep===100 表示使用外部Colab模型，标记 useExternalModel:true
                 combos.push({
                   id: `lstm-${lb}-${ep}-${fs}-${sp}-${bm}`.replace(/\./g,''),
                   modelType:'lstm',
                   lookBack:lb, lstmEpochs:ep,
+                  useExternalModel: ep===100,
                   featureSet:fs, split:sp, betMode:bm,
-                  label:`LSTM·LB${lb}·${fs==='full'?'69维':'33维'}·${bm==='single'?'单式':bm==='dynamic'?'动态博弈':bm==='compound'?'复式':'胆拖'}(${ep}轮)`
+                  label: ep===100
+                    ? `LSTM·LB${lb}·${fs==='full'?'69维':'33维'}·${bm==='single'?'单式':bm==='dynamic'?'动态博弈':bm==='compound'?'复式':'胆拖'}(Colab模型)`
+                    : `LSTM·LB${lb}·${fs==='full'?'69维':'33维'}·${bm==='single'?'单式':bm==='dynamic'?'动态博弈':bm==='compound'?'复式':'胆拖'}(${ep}轮)`
                 });
               }
             }
@@ -6546,7 +6731,7 @@ function ApStabilityMatrix({done}){
 }
 
 // ── AutoPilot 主标签页组件（Phase 3）──
-function AutoPilotTab({data, trainSplit}){
+function AutoPilotTab({data, trainSplit, activeModel}){
   const {useState:us, useEffect:ue, useRef:ur, useMemo:um, useCallback:uc} = React;
 
   // ── 配置面板状态 ──
@@ -6573,10 +6758,11 @@ function AutoPilotTab({data, trainSplit}){
   const [expandedRow, setExpandedRow] = us(null);
   const [riskAcknowledged, setRiskAcknowledged] = us(false);
   const [analysisTab, setAnalysisTab] = us('overview');
+  const [finishType, setFinishType] = us('completed'); // 'completed' | 'partial'
 
   // ── Phase 3: 断点续跑 ──
-  const [resumeSession, setResumeSession] = us(null); // 检测到的历史session
-  const [timeoutWarnings, setTimeoutWarnings] = us([]); // 超时记录
+  const [resumeSession, setResumeSession] = us(null);
+  const [timeoutWarnings, setTimeoutWarnings] = us([]);
 
   // ── Phase 3: AI研判状态 ──
   const [aiApiKey, setAiApiKey] = us(()=>{ try{ return localStorage.getItem('ssq_gemini_key')||''; }catch(e){ return ''; } });
@@ -6585,12 +6771,59 @@ function AutoPilotTab({data, trainSplit}){
   const [aiError, setAiError] = us('');
   const [showKeyInput, setShowKeyInput] = us(false);
 
+  // ── 历史记录：每次完整/中途完成后持久化到localStorage ──
+  const AP_HISTORY_KEY = 'ssq_ap_history';
+  const [apHistory, setApHistory] = us(()=>{
+    try{ const r=localStorage.getItem(AP_HISTORY_KEY); return r?JSON.parse(r):[]; }catch(e){ return []; }
+  });
+  const [showHistory, setShowHistory] = us(false);
+  const [historyViewIdx, setHistoryViewIdx] = us(null); // 正在预览的历史记录索引
+
+  function apSaveHistory(results, matrix, elapsed, finishType, cfg){
+    const rec = {
+      id: Date.now(),
+      time: new Date().toLocaleString('zh-CN'),
+      finishType, // 'completed' | 'partial'
+      totalCombos: matrix.length,
+      doneCombos: results.filter(r=>r.status==='done').length,
+      elapsed,
+      bestAlpha: results.filter(r=>r.status==='done').length>0
+        ? Math.max(...results.filter(r=>r.status==='done').map(r=>r.alpha)) : null,
+      cfgSummary: `${cfg.modelTypes.join('+')} · LB${cfg.lookBacks.join('/')} · ${cfg.betModes.join('+')}`,
+      results: results.map(r=>({ // 压缩存储，去掉大字段
+        ...r,
+        equityCurve: r.equityCurve ? r.equityCurve.slice(0,50) : undefined,
+      })),
+      matrix,
+      cfg,
+    };
+    setApHistory(prev=>{
+      const next = [rec, ...prev].slice(0, 30); // 最多保留30条
+      try{ localStorage.setItem(AP_HISTORY_KEY, JSON.stringify(next)); }catch(e){}
+      return next;
+    });
+    return rec;
+  }
+  function apDeleteHistory(id){
+    setApHistory(prev=>{
+      const next = prev.filter(r=>r.id!==id);
+      try{ localStorage.setItem(AP_HISTORY_KEY, JSON.stringify(next)); }catch(e){}
+      return next;
+    });
+  }
+
   const pauseRef = ur(false);
   const timerRef = ur(null);
   const resultsRef = ur([]); // 保持最新results引用（用于session保存）
+  const cfgRef = ur(cfg);    // 保持最新cfg（供异步函数访问）
+  const elapsedRef = ur(0);  // 保持最新elapsed
+  const matrixRef = ur([]);  // 保持最新matrix
 
-  // 同步 resultsRef
+  // 同步 refs
   ue(()=>{ resultsRef.current = results; }, [results]);
+  ue(()=>{ cfgRef.current = cfg; }, [cfg]);
+  ue(()=>{ elapsedRef.current = elapsed; }, [elapsed]);
+  ue(()=>{ matrixRef.current = matrix; }, [matrix]);
 
   // 启动时检测断点session
   ue(()=>{
@@ -6620,6 +6853,11 @@ function AutoPilotTab({data, trainSplit}){
   const dataLen = data ? data.length : 500;
   const estSec = combo.reduce((s,c)=>{
     if(c.modelType==='lstm'){
+      if(c.useExternalModel){
+        // 外部Colab模型：只有推理+回测，按30ms/期估算
+        const testLen = Math.floor(dataLen * (1-(c.split||0.8)));
+        return s + Math.max(15, Math.ceil(testLen * 31 / 1000));
+      }
       const trainSamples = Math.floor(dataLen * (c.split||0.8));
       const epochs = c.lstmEpochs || 15;
       return s + Math.max(30, Math.ceil((epochs * trainSamples * 3 + Math.floor(dataLen*(1-(c.split||0.8)))*11) / 1000));
@@ -6636,6 +6874,16 @@ function AutoPilotTab({data, trainSplit}){
       return {...p,[key]:next.length?next:arr};
     });
   }
+
+  // 外部模型卸载时自动移除100轮选项（防止用户选了100但模型不在）
+  ue(()=>{
+    if(!activeModel){
+      setCfg(p=>({...p, lstmEpochs: p.lstmEpochs.filter(e=>e!==100).length
+        ? p.lstmEpochs.filter(e=>e!==100)
+        : p.lstmEpochs.includes(100) ? [15] : p.lstmEpochs
+      }));
+    }
+  }, [activeModel]);
 
   // ── Phase 3: 从断点续跑 ──
   async function resumeFromSession(){
@@ -6665,9 +6913,11 @@ function AutoPilotTab({data, trainSplit}){
         setResults(r=>[...r,{...mx[i], error:e.message, status:isTimeout?'timeout':'error'}]);
       }
       // 每完成5个组合就存档
-      if((i-startIdx+1)%5===0) apSaveSession(mx, resultsRef.current, cfg, elapsed);
+      if((i-startIdx+1)%5===0) apSaveSession(mx, resultsRef.current, cfg, elapsedRef.current);
     }
     apClearSession();
+    apSaveHistory(resultsRef.current, mx, elapsedRef.current, 'completed', cfgRef.current);
+    setFinishType('completed');
     setStatus('COMPLETED');
     setAnalysisTab('overview');
   }
@@ -6684,7 +6934,7 @@ function AutoPilotTab({data, trainSplit}){
       if(pauseRef.current){
         setStatus('PAUSED');
         // 暂停时也保存断点
-        apSaveSession(mx, resultsRef.current, cfg, elapsed);
+        apSaveSession(mx, resultsRef.current, cfg, elapsedRef.current);
         await new Promise(res=>{ const chk=setInterval(()=>{ if(!pauseRef.current){ clearInterval(chk); res(); }},200); });
         setStatus('RUNNING');
       }
@@ -6698,9 +6948,11 @@ function AutoPilotTab({data, trainSplit}){
         setResults(r=>[...r,{...mx[i], error:e.message, status:isTimeout?'timeout':'error'}]);
       }
       // 每完成5个组合就存档断点
-      if((i+1)%5===0) apSaveSession(mx, resultsRef.current, cfg, elapsed);
+      if((i+1)%5===0) apSaveSession(mx, resultsRef.current, cfg, elapsedRef.current);
     }
     apClearSession();
+    apSaveHistory(resultsRef.current, mx, elapsedRef.current, 'completed', cfgRef.current);
+    setFinishType('completed');
     setStatus('COMPLETED');
     setAnalysisTab('overview');
   }
@@ -6716,17 +6968,46 @@ function AutoPilotTab({data, trainSplit}){
     let preds = null;
 
     if(exp.modelType === 'lstm'){
-      // ── LSTM 分支 ──
-      setCurPhase('训练 LSTM (轻量)...');
-      const lstmArtifact = await apTrainLSTM(trainData,
-        {lookBack: exp.lookBack, lstmEpochs: exp.lstmEpochs || 15},
-        p=>setInnerProg(Math.round(p*0.7)));
-      setCurPhase('LSTM 推理测试集...'); setInnerProg(70);
-      await new Promise(r=>setTimeout(r,0));
-      preds = await apLSTMInferTest(lstmArtifact, testData, allData);
-      setInnerProg(80);
-      // 释放LSTM张量，避免内存泄漏
-      apDisposeLSTM(lstmArtifact);
+      if(exp.useExternalModel){
+        // ── 外部Colab模型分支：直接用已加载模型推理，无需训练 ──
+        const extModel = activeModel; // 从 prop 拿
+        if(!extModel){ setResults(r=>[...r,{...exp,error:'未加载Colab模型，请在模型实验页上传',status:'error'}]); setInnerProg(0); return; }
+        setCurPhase('Colab模型推理测试集...'); setInnerProg(30);
+        await new Promise(r=>setTimeout(r,0));
+        // 逐期推理（复用 runInference，与模型实验页一致）
+        const extPreds = [];
+        const allSorted = [...allData].sort((a,b)=>new Date(a.date)-new Date(b.date));
+        const lookBack = exp.lookBack || 20;
+        let pi = 0;
+        for(const td of testData){
+          const idx = allSorted.findIndex(d=>d.issue===td.issue);
+          if(idx < lookBack){ pi++; continue; }
+          const win = allSorted.slice(idx-lookBack, idx);
+          const ctx = buildDataContext(allSorted.slice(0, idx));
+          const features = win.map((d,j)=>encodeFeatures(d, ctx, j>0?win[j-1]:null));
+          try{
+            const res = await runInference(extModel, features, {temperature:1.0}, false);
+            extPreds.push({issue:td.issue, redProbs:res.redProbs, blueProbs:res.blueProbs,
+              uncertaintyRed:res.uncertaintyRed, entropyRed:res.entropyRed, riskLevel:res.riskLevel});
+          }catch(e){ /* 单期失败跳过 */ }
+          pi++;
+          if(pi%20===0){ setInnerProg(30+Math.round(pi/testData.length*50)); await tf.nextFrame(); }
+        }
+        preds = extPreds;
+        setInnerProg(80);
+      } else {
+        // ── 轻量LSTM分支：浏览器内训练 ──
+        setCurPhase('训练 LSTM (轻量)...');
+        const lstmArtifact = await apTrainLSTM(trainData,
+          {lookBack: exp.lookBack, lstmEpochs: exp.lstmEpochs || 15},
+          p=>setInnerProg(Math.round(p*0.7)));
+        setCurPhase('LSTM 推理测试集...'); setInnerProg(70);
+        await new Promise(r=>setTimeout(r,0));
+        preds = await apLSTMInferTest(lstmArtifact, testData, allData);
+        setInnerProg(80);
+        // 释放LSTM张量，避免内存泄漏
+        apDisposeLSTM(lstmArtifact);
+      }
     } else {
       // ── XGBoost 分支（默认）──
       setCurPhase('训练 XGBoost...');
@@ -6761,12 +7042,27 @@ function AutoPilotTab({data, trainSplit}){
     if(status==='RUNNING'){ pauseRef.current=true; setStatus('PAUSED'); }
     else if(status==='PAUSED'){ pauseRef.current=false; setStatus('RUNNING'); }
   }
+  // ── 中途完成：停止流水线，保存已有记录，进入分析模式 ──
+  function finishPartial(){
+    if(status!=='PAUSED') return;
+    pauseRef.current=true; // 确保流水线不再继续
+    apClearSession();
+    const curResults = resultsRef.current;
+    const curMatrix = matrixRef.current;
+    const curElapsed = elapsedRef.current;
+    apSaveHistory(curResults, curMatrix, curElapsed, 'partial', cfgRef.current);
+    setFinishType('partial');
+    setStatus('COMPLETED');
+    setAnalysisTab('overview');
+  }
   function reset(){
     pauseRef.current=true;
     apClearSession();
     setResumeSession(null);
+    setHistoryViewIdx(null);
     setStatus('IDLE'); setResults([]); setMatrix([]); setCurIdx(0); setElapsed(0);
     setTimeoutWarnings([]); setAiReport(''); setAiError('');
+    setFinishType('completed');
   }
 
   const roiColor = roi => roi>0?'text-green-600 font-bold':roi>-30?'text-yellow-600':roi>-60?'text-orange-600':'text-red-600';
@@ -6898,6 +7194,75 @@ ${htmlLines}
 
   return h('div',{className:'space-y-5 pb-10'},
 
+    // ═══ 历史记录面板 ═══
+    h('div',{className:'bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden'},
+      h('div',{
+        className:'px-5 py-3 border-b bg-slate-50 flex items-center justify-between cursor-pointer select-none',
+        onClick:()=>setShowHistory(v=>!v)
+      },
+        h('div',{className:'flex items-center gap-3'},
+          h('span',{className:'font-bold text-slate-700'},'📂 历史记录'),
+          h('span',{className:'text-xs text-slate-400'},`共 ${apHistory.length} 条记录`),
+          apHistory.length>0&&h('span',{className:'text-xs text-slate-400'},
+            `· 最近: ${apHistory[0].time}`)
+        ),
+        h('div',{className:'flex items-center gap-2'},
+          apHistory.length>0&&h('span',{
+            className:'text-xs px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 font-bold'
+          },`${apHistory.filter(r=>r.finishType==='completed').length} 完整 + ${apHistory.filter(r=>r.finishType==='partial').length} 中途`),
+          h('span',{className:'text-slate-400 text-sm'},showHistory?'▲':'▼')
+        )
+      ),
+      showHistory&&h('div',{className:'divide-y divide-slate-100 max-h-96 overflow-y-auto'},
+        apHistory.length===0
+          ? h('div',{className:'text-center py-8 text-slate-400 text-sm'},'暂无历史记录，完成实验后自动保存')
+          : apHistory.map((rec,idx)=>{
+            const isViewing = historyViewIdx === rec.id;
+            return h('div',{key:rec.id,className:'p-4 hover:bg-slate-50 transition-colors'},
+              h('div',{className:'flex items-start justify-between gap-3'},
+                h('div',{className:'flex-1 min-w-0'},
+                  h('div',{className:'flex items-center gap-2 mb-1 flex-wrap'},
+                    h('span',{className:`text-xs px-2 py-0.5 rounded-full font-bold ${rec.finishType==='completed'?'bg-blue-100 text-blue-700':'bg-amber-100 text-amber-700'}`},
+                      rec.finishType==='completed'?'✓ 完整完成':'⬡ 中途完成'),
+                    h('span',{className:'text-xs text-slate-500'},rec.time),
+                    h('span',{className:'text-xs text-slate-400'},
+                      `${rec.doneCombos}/${rec.totalCombos}组合 · ${Math.floor(rec.elapsed/60)}分${rec.elapsed%60}秒`)
+                  ),
+                  h('div',{className:'text-xs text-slate-600 truncate mb-1'},rec.cfgSummary),
+                  rec.bestAlpha!=null&&h('div',{className:'text-xs'},
+                    h('span',{className:'text-slate-400'},'最佳超额: '),
+                    h('span',{className:`font-bold font-mono ${rec.bestAlpha>=0?'text-green-600':'text-red-500'}`},
+                      `${rec.bestAlpha>=0?'+':''}${rec.bestAlpha.toFixed(1)}%`)
+                  )
+                ),
+                h('div',{className:'flex gap-1.5 shrink-0'},
+                  h('button',{
+                    onClick:()=>{
+                      if(isViewing){ setHistoryViewIdx(null); }
+                      else{
+                        setHistoryViewIdx(rec.id);
+                        setResults(rec.results||[]);
+                        setMatrix(rec.matrix||[]);
+                        setElapsed(rec.elapsed||0);
+                        setFinishType(rec.finishType||'completed');
+                        setStatus('COMPLETED');
+                        setAnalysisTab('overview');
+                        setShowHistory(false);
+                      }
+                    },
+                    className:`px-3 py-1 text-xs font-bold rounded-lg border transition-all ${isViewing?'bg-indigo-600 text-white border-indigo-600':'border-indigo-300 text-indigo-600 hover:bg-indigo-50'}`
+                  },isViewing?'收起':'查看'),
+                  h('button',{
+                    onClick:()=>{ if(window.confirm('删除这条历史记录？')) apDeleteHistory(rec.id); },
+                    className:'px-2 py-1 text-xs font-bold rounded-lg border border-slate-200 text-slate-400 hover:bg-slate-100 transition-all'
+                  },'删')
+                )
+              )
+            );
+          })
+      )
+    ),
+
     // ═══ Phase 3: 断点续跑提示 ═══
     resumeSession&&status==='IDLE'&&h('div',{className:'bg-indigo-50 border border-indigo-300 rounded-xl p-4 flex items-center justify-between'},
       h('div',{className:'flex items-center gap-3'},
@@ -6981,11 +7346,33 @@ ${htmlLines}
               h('div',{className:'flex flex-wrap gap-1'},
                 [10,15,20,30].map(v=>h('button',{key:v,onClick:()=>toggleArr('lstmEpochs',v),
                   className:`px-2.5 py-0.5 rounded-full text-xs font-bold border transition-all ${cfg.lstmEpochs.includes(v)?'bg-purple-600 text-white border-purple-600':'bg-white text-slate-500 border-slate-200 hover:border-purple-300'}`
-                },v))
+                },v)),
+                // 100轮：只有加载了外部Colab模型才可选
+                h('div',{className:'relative group'},
+                  h('button',{
+                    key:100,
+                    onClick:()=>{ if(activeModel) toggleArr('lstmEpochs',100); },
+                    disabled:!activeModel,
+                    title: activeModel ? 'Colab模型已加载，直接对测试集推理验证' : '请先在「模型实验」页加载Colab训练模型',
+                    className:`px-2.5 py-0.5 rounded-full text-xs font-bold border transition-all ${
+                      !activeModel
+                        ? 'bg-slate-100 text-slate-300 border-slate-200 cursor-not-allowed'
+                        : cfg.lstmEpochs.includes(100)
+                          ? 'bg-indigo-600 text-white border-indigo-600'
+                          : 'bg-white text-indigo-600 border-indigo-300 hover:bg-indigo-50'
+                    }`
+                  },
+                    activeModel ? '100 (Colab✓)' : '100 (未加载)'
+                  )
+                )
               )
             ),
-            h('div',{className:'text-xs text-purple-500 bg-purple-50 p-2 rounded'},
-              '⏱ LSTM约60s/组合，建议从15轮开始')
+            h('div',{className:'text-xs bg-purple-50 p-2 rounded space-y-1'},
+              h('div',{className:'text-purple-500'},'⏱ 轻量LSTM约60s/组合，建议从15轮开始'),
+              activeModel && h('div',{className:'text-indigo-600 font-bold'},
+                '✅ Colab模型已加载 — 选100轮可直接对测试集推理验证，无需重新训练'
+              )
+            )
           )
         ),
         // 特征层
@@ -7042,13 +7429,18 @@ ${htmlLines}
       h('div',{className:'flex items-center justify-between mb-4'},
         h('div',{className:'flex items-center gap-3'},
           h('div',{className:'text-lg font-bold text-slate-800'},'🤖 AutoPilot'),
-          h('span',{className:`text-xs px-2.5 py-0.5 rounded-full font-bold ${status==='RUNNING'?'bg-green-100 text-green-700 animate-pulse':status==='PAUSED'?'bg-amber-100 text-amber-700':'bg-blue-100 text-blue-700'}`},
-            status==='RUNNING'?'● 运行中':status==='PAUSED'?'⏸ 已暂停':'✓ 已完成')
+          h('span',{className:`text-xs px-2.5 py-0.5 rounded-full font-bold ${status==='RUNNING'?'bg-green-100 text-green-700 animate-pulse':status==='PAUSED'?'bg-amber-100 text-amber-700':status==='COMPLETED'&&finishType==='partial'?'bg-amber-100 text-amber-700':'bg-blue-100 text-blue-700'}`},
+            status==='RUNNING'?'● 运行中':status==='PAUSED'?'⏸ 已暂停':status==='COMPLETED'&&finishType==='partial'?'⬡ 中途完成':'✓ 已完成')
         ),
         h('div',{className:'flex gap-2'},
           status!=='COMPLETED'&&h('button',{onClick:pauseResume,
             className:`px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${status==='PAUSED'?'bg-green-600 text-white hover:bg-green-700':'bg-amber-50 border border-amber-300 text-amber-700 hover:bg-amber-100'}`
           },status==='PAUSED'?'▶ 继续':'⏸ 暂停'),
+          // 中途完成：仅在暂停时显示
+          status==='PAUSED'&&h('button',{
+            onClick:()=>{ if(window.confirm('中途完成将终止剩余组合，保存已有记录并进入分析模式。确认吗？')) finishPartial(); },
+            className:'px-4 py-1.5 rounded-lg text-xs font-bold border border-indigo-300 text-indigo-700 bg-indigo-50 hover:bg-indigo-100 transition-all'
+          },'✓ 中途完成'),
           h('button',{onClick:reset,className:'px-4 py-1.5 rounded-lg text-xs font-bold border border-slate-200 text-slate-500 hover:bg-slate-50 transition-all'},'🔄 重置')
         )
       ),
@@ -7056,7 +7448,19 @@ ${htmlLines}
       h('div',{className:'mb-3'},
         h('div',{className:'flex justify-between text-xs text-slate-500 mb-1.5'},
           h('span',{className:'font-medium'},`总进度 ${Math.min(results.length, matrix.length)} / ${matrix.length} 组合`),
-          h('span',{},`已用时 ${fmtTime(elapsed)}${status==='RUNNING'&&matrix.length?` · 预计剩余 ~${fmtTime(Math.max(0,(matrix.length-results.length)*Math.ceil(elapsed/Math.max(results.length,1))))}` :''}`)
+          h('span',{},`已用时 ${fmtTime(elapsed)}${status==='RUNNING'&&matrix.length?(()=>{
+            // 用剩余组合的预估秒数（与配置面板estSec逻辑一致），而非历史平均速度
+            const dLen = data ? data.length : 500;
+            const remEstSec = matrix.slice(results.length).reduce((s,c)=>{
+              if(c.modelType==='lstm'){
+                const tr = Math.floor(dLen*(c.split||0.8));
+                const ep = c.lstmEpochs||15;
+                return s + Math.max(30, Math.ceil((ep*tr*3 + Math.floor(dLen*(1-(c.split||0.8)))*11)/1000));
+              }
+              return s + 20;
+            },0);
+            return ` · 预计剩余 ~${fmtTime(remEstSec)}`;
+          })():''}`)
         ),
         h('div',{className:'w-full bg-slate-100 rounded-full h-3 overflow-hidden'},
           h('div',{className:'bg-indigo-600 h-3 rounded-full transition-all',
@@ -7126,7 +7530,7 @@ ${htmlLines}
                           r.modelType==='lstm'?'LSTM':'XGB'),
                         h('span',{className:'text-slate-400 text-xs'},
                           r.modelType==='lstm'
-                            ? `LB${r.lookBack} · ${r.lstmEpochs||15}轮`
+                            ? (r.useExternalModel ? `LB${r.lookBack} · Colab模型` : `LB${r.lookBack} · ${r.lstmEpochs||15}轮`)
                             : `LB${r.lookBack} · ${r.nTrees}棵 · lr${r.lr} · 深${r.depth}`)
                       )
                     ),
@@ -7607,7 +8011,497 @@ ${htmlLines}
   );
 }
 
+// ══════════════════════════════════════════════════════════════════
+// USER MANAGEMENT SYSTEM — v1.5.7-almost
+// ══════════════════════════════════════════════════════════════════
+
+// 用户数据持久化工具（使用 localStorage）
+const UM = {
+  USERS_KEY: 'ssq_users_v1',
+  SESSION_KEY: 'ssq_session_v1',
+  LOGS_KEY: 'ssq_logs_v1',
+  UPGRADE_REQS_KEY: 'ssq_upgrade_reqs_v1',
+
+  getUsers() {
+    try { return JSON.parse(localStorage.getItem(this.USERS_KEY)||'[]'); } catch(e){ return []; }
+  },
+  saveUsers(users) { localStorage.setItem(this.USERS_KEY, JSON.stringify(users)); },
+
+  getSession() {
+    try { return JSON.parse(localStorage.getItem(this.SESSION_KEY)||'null'); } catch(e){ return null; }
+  },
+  saveSession(user) { localStorage.setItem(this.SESSION_KEY, JSON.stringify(user)); },
+  clearSession() { localStorage.removeItem(this.SESSION_KEY); },
+
+  getLogs() { try { return JSON.parse(localStorage.getItem(this.LOGS_KEY)||'[]'); } catch(e){ return []; } },
+  addLog(username, action) {
+    const logs = this.getLogs();
+    logs.unshift({ username, action, time: new Date().toISOString() });
+    if(logs.length>500) logs.splice(500);
+    localStorage.setItem(this.LOGS_KEY, JSON.stringify(logs));
+  },
+
+  getUpgradeReqs() { try { return JSON.parse(localStorage.getItem(this.UPGRADE_REQS_KEY)||'[]'); } catch(e){ return []; } },
+  saveUpgradeReqs(reqs) { localStorage.setItem(this.UPGRADE_REQS_KEY, JSON.stringify(reqs)); },
+
+  initAdmin() {
+    let users = this.getUsers();
+    if(!users.find(u=>u.role==='superadmin')) {
+      users.push({
+        id: 'admin_001',
+        username: 'admin',
+        realname: '超级管理员',
+        phone: '18888888888',
+        address: '',
+        password: 'Admin123',
+        role: 'superadmin', // superadmin | pro | basic
+        createdAt: new Date().toISOString(),
+        lastLogin: null,
+        loginCount: 0,
+        tabVisits: {}
+      });
+      this.saveUsers(users);
+    }
+  },
+
+  register({ username, realname, phone, address, password }) {
+    const users = this.getUsers();
+    if(users.find(u=>u.username===username)) return { ok:false, msg:'用户名已存在' };
+    if(!/(?=.*[a-zA-Z])(?=.*\d).{6,}/.test(password)) return { ok:false, msg:'密码需至少6位，且包含字母和数字' };
+    const newUser = {
+      id: 'u_'+Date.now(),
+      username, realname, phone, address: address||'',
+      password,
+      role: 'basic',
+      createdAt: new Date().toISOString(),
+      lastLogin: null,
+      loginCount: 0,
+      tabVisits: {}
+    };
+    users.push(newUser);
+    this.saveUsers(users);
+    this.addLog(username, '注册账户');
+    return { ok:true, user: newUser };
+  },
+
+  login(username, password) {
+    const users = this.getUsers();
+    const user = users.find(u=>u.username===username && u.password===password);
+    if(!user) return { ok:false, msg:'用户名或密码错误' };
+    user.lastLogin = new Date().toISOString();
+    user.loginCount = (user.loginCount||0)+1;
+    this.saveUsers(users);
+    this.saveSession(user);
+    this.addLog(username, '登录');
+    return { ok:true, user };
+  },
+
+  logout(username) {
+    this.addLog(username, '退出登录');
+    this.clearSession();
+  },
+
+  recordTabVisit(username, tabId) {
+    const users = this.getUsers();
+    const user = users.find(u=>u.username===username);
+    if(!user) return;
+    if(!user.tabVisits) user.tabVisits={};
+    user.tabVisits[tabId] = (user.tabVisits[tabId]||0)+1;
+    this.saveUsers(users);
+    this.saveSession(user);
+  },
+
+  updateUserRole(userId, newRole) {
+    const users = this.getUsers();
+    const idx = users.findIndex(u=>u.id===userId);
+    if(idx<0) return false;
+    users[idx].role = newRole;
+    this.saveUsers(users);
+    const sess = this.getSession();
+    if(sess && sess.id===userId) { this.saveSession(users[idx]); }
+    return true;
+  },
+
+  deleteUser(userId) {
+    let users = this.getUsers();
+    users = users.filter(u=>u.id!==userId);
+    this.saveUsers(users);
+  },
+
+  requestUpgrade(username) {
+    const reqs = this.getUpgradeReqs();
+    if(reqs.find(r=>r.username===username&&r.status==='pending')) return { ok:false, msg:'已有待审批申请' };
+    reqs.push({ username, requestedAt: new Date().toISOString(), status:'pending' });
+    this.saveUpgradeReqs(reqs);
+    this.addLog(username, '申请升级专业版');
+    return { ok:true };
+  },
+
+  approveUpgrade(username, approve) {
+    const reqs = this.getUpgradeReqs();
+    const req = reqs.find(r=>r.username===username&&r.status==='pending');
+    if(!req) return false;
+    req.status = approve?'approved':'rejected';
+    req.processedAt = new Date().toISOString();
+    this.saveUpgradeReqs(reqs);
+    if(approve) {
+      const users = this.getUsers();
+      const user = users.find(u=>u.username===username);
+      if(user) { user.role='pro'; this.saveUsers(users); }
+    }
+    this.addLog('admin', `${approve?'批准':'拒绝'}用户 ${username} 升级申请`);
+    return true;
+  }
+};
+
+// 初始化超级管理员账户
+UM.initAdmin();
+
+// ── 登录/注册 页面组件 ──
+function AuthPage({ onLogin }) {
+  const [mode, setMode] = useState('login'); // 'login' | 'register'
+  const [form, setForm] = useState({ username:'', realname:'', phone:'', address:'', password:'', confirm:'' });
+  const [err, setErr] = useState('');
+  const [ok, setOk] = useState('');
+
+  const set = (k,v) => setForm(f=>({...f,[k]:v}));
+
+  const doLogin = () => {
+    setErr(''); setOk('');
+    if(!form.username||!form.password){ setErr('请填写用户名和密码'); return; }
+    const res = UM.login(form.username, form.password);
+    if(!res.ok){ setErr(res.msg); return; }
+    onLogin(res.user);
+  };
+
+  const doRegister = () => {
+    setErr(''); setOk('');
+    if(!form.username||!form.realname||!form.phone||!form.password){ setErr('请填写必填字段'); return; }
+    if(!/^1\d{10}$/.test(form.phone)){ setErr('手机号格式不正确'); return; }
+    if(form.password!==form.confirm){ setErr('两次密码不一致'); return; }
+    if(!/(?=.*[a-zA-Z])(?=.*\d).{6,}/.test(form.password)){ setErr('密码需至少6位，包含字母和数字（不区分大小写）'); return; }
+    const res = UM.register(form);
+    if(!res.ok){ setErr(res.msg); return; }
+    setOk('注册成功！请登录');
+    setMode('login');
+    setForm(f=>({...f,password:'',confirm:'',realname:'',phone:'',address:''}));
+  };
+
+  const inp = (label, key, type='text', placeholder='', required=true) =>
+    h('div',{className:'mb-4'},
+      h('label',{className:'block text-sm font-medium text-slate-700 mb-1'},label, required&&h('span',{className:'text-red-500 ml-1'},'*')),
+      h('input',{type,value:form[key],onChange:e=>set(key,e.target.value),placeholder,
+        className:'w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-300 bg-white'})
+    );
+
+  return h('div',{className:'min-h-screen bg-gradient-to-br from-slate-900 via-indigo-950 to-slate-900 flex items-center justify-center p-4'},
+    h('div',{className:'w-full max-w-md'},
+      // Logo
+      h('div',{className:'text-center mb-8'},
+        h('div',{className:'inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-indigo-500/20 border border-indigo-500/30 text-indigo-400 mb-4'},
+          h('svg',{xmlns:'http://www.w3.org/2000/svg',width:32,height:32,viewBox:'0 0 24 24',fill:'none',stroke:'currentColor',strokeWidth:2,strokeLinecap:'round',strokeLinejoin:'round'},
+            h('polyline',{points:'22 12 18 12 15 21 9 3 6 12 2 12'})
+          )
+        ),
+        h('h1',{className:'text-2xl font-bold text-white tracking-tight'},'SSQ 量化预测系统'),
+        h('p',{className:'text-indigo-400 text-sm font-mono mt-1'},'v1.5.7-almost')
+      ),
+      // Card
+      h('div',{className:'bg-white rounded-2xl shadow-2xl overflow-hidden'},
+        // Tabs
+        h('div',{className:'flex border-b border-slate-100'},
+          h('button',{onClick:()=>{setMode('login');setErr('');setOk('');},
+            className:`flex-1 py-4 text-sm font-semibold transition-colors ${mode==='login'?'bg-indigo-600 text-white':'text-slate-500 hover:text-slate-700'}`},'登录'),
+          h('button',{onClick:()=>{setMode('register');setErr('');setOk('');},
+            className:`flex-1 py-4 text-sm font-semibold transition-colors ${mode==='register'?'bg-indigo-600 text-white':'text-slate-500 hover:text-slate-700'}`},'注册新账户')
+        ),
+        h('div',{className:'p-6'},
+          err&&h('div',{className:'mb-4 p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-600'},err),
+          ok&&h('div',{className:'mb-4 p-3 bg-green-50 border border-green-200 rounded-lg text-sm text-green-600'},ok),
+
+          mode==='login'&&h('div',{},
+            inp('用户名','username','text','请输入用户名'),
+            inp('密码','password','password','请输入密码'),
+            h('button',{onClick:doLogin,className:'w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-semibold text-sm transition-colors mt-2'},'登录'),
+            h('div',{className:'mt-4 p-3 bg-amber-50 border border-amber-100 rounded-lg text-xs text-amber-700 leading-relaxed'},
+              h('p',{className:'font-semibold text-amber-800 mb-1'},'⚠️ 使用声明'),
+              h('p',{},'本平台仅基于双色球历史公开数据进行大数据统计分析，所有模型与策略均为实验性研究，不构成任何投注建议。彩票具有随机性，历史规律不代表未来走势，请理性参与，量力而行。')
+            )
+          ),
+
+          mode==='register'&&h('div',{},
+            inp('用户名','username','text','字母、数字、下划线'),
+            inp('实名','realname','text','请输入真实姓名'),
+            inp('手机号','phone','tel','11位手机号'),
+            h('div',{className:'mb-4'},
+              h('label',{className:'block text-sm font-medium text-slate-700 mb-1'},'地址',h('span',{className:'text-slate-400 ml-1'},'(可选)')),
+              h('input',{type:'text',value:form.address,onChange:e=>set('address',e.target.value),placeholder:'省市区详细地址',
+                className:'w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-300 bg-white'})
+            ),
+            inp('密码','password','password','至少6位，含字母和数字'),
+            inp('确认密码','confirm','password','再次输入密码'),
+            h('div',{className:'mb-4 p-3 bg-blue-50 border border-blue-100 rounded-lg text-xs text-blue-700'},
+              '注册后为基础版账户，可使用数据分析、模型实验等功能。如需开通智能决策功能，可在账户页面申请升级专业版。'
+            ),
+            h('button',{onClick:doRegister,className:'w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-semibold text-sm transition-colors'},'注册')
+          )
+        )
+      )
+    )
+  );
+}
+
+// ── 账户面板（右上角抽屉）──
+function AccountPanel({ user, onClose, onLogout, onUserUpdate }) {
+  const [view, setView] = useState('profile'); // profile | admin
+  const [upgradeMsg, setUpgradeMsg] = useState('');
+  const [adminTab, setAdminTab] = useState('overview'); // overview | users | logs | upgrade
+  const [users, setUsers] = useState(UM.getUsers());
+  const [logs, setLogs] = useState(UM.getLogs());
+  const [upgradeReqs, setUpgradeReqs] = useState(UM.getUpgradeReqs());
+
+  const refreshData = () => {
+    setUsers(UM.getUsers());
+    setLogs(UM.getLogs());
+    setUpgradeReqs(UM.getUpgradeReqs());
+  };
+
+  const roleLabel = r => r==='superadmin'?'超级管理员':r==='pro'?'专业版':'基础版';
+  const roleBadgeClass = r => r==='superadmin'?'bg-purple-100 text-purple-700':r==='pro'?'bg-amber-100 text-amber-700':'bg-slate-100 text-slate-600';
+
+  const handleUpgradeRequest = () => {
+    const res = UM.requestUpgrade(user.username);
+    setUpgradeMsg(res.ok?'✅ 申请已提交，等待管理员审批':res.msg);
+    setTimeout(()=>setUpgradeMsg(''),4000);
+  };
+
+  const handleRoleChange = (uid, newRole) => {
+    if(uid===user.id&&newRole!=='superadmin') { alert('不能降级当前登录账户'); return; }
+    UM.updateUserRole(uid, newRole);
+    refreshData();
+    onUserUpdate(UM.getSession());
+  };
+
+  const handleDelete = (uid) => {
+    if(uid===user.id) { alert('不能删除当前登录账户'); return; }
+    if(!confirm('确认删除该账户？')) return;
+    UM.deleteUser(uid);
+    refreshData();
+  };
+
+  const handleApprove = (username, approve) => {
+    UM.approveUpgrade(username, approve);
+    refreshData();
+    onUserUpdate(UM.getSession());
+  };
+
+  // 活跃度统计
+  const totalLogins = users.reduce((s,u)=>s+(u.loginCount||0),0);
+  const activeUsers = users.filter(u=>{
+    if(!u.lastLogin) return false;
+    return (Date.now()-new Date(u.lastLogin).getTime())<7*24*3600*1000;
+  }).length;
+
+  return h('div',{className:'fixed inset-0 z-50 flex justify-end',onClick:e=>{if(e.target===e.currentTarget)onClose();}},
+    h('div',{className:'fixed inset-0 bg-black/40',onClick:onClose}),
+    h('div',{className:'relative bg-white h-full w-full max-w-sm flex flex-col shadow-2xl z-10 overflow-hidden'},
+
+      // Header
+      h('div',{className:'bg-gradient-to-r from-indigo-700 to-indigo-600 p-5 text-white'},
+        h('div',{className:'flex items-center justify-between mb-3'},
+          h('div',{className:'font-bold text-base'},'账户中心'),
+          h('button',{onClick:onClose,className:'text-indigo-200 hover:text-white text-xl leading-none'},'×')
+        ),
+        h('div',{className:'flex items-center gap-3'},
+          h('div',{className:'w-12 h-12 rounded-full bg-white/20 flex items-center justify-center text-xl font-bold'},
+            user.realname?user.realname[0]:user.username[0]
+          ),
+          h('div',{},
+            h('div',{className:'font-semibold text-base leading-tight'},user.realname||user.username),
+            h('div',{className:'text-indigo-200 text-xs mt-0.5'},`@${user.username}`),
+            h('span',{className:`mt-1 inline-block text-xs px-2 py-0.5 rounded-full font-medium bg-white/20 text-white`},roleLabel(user.role))
+          )
+        )
+      ),
+
+      // Tab strip
+      h('div',{className:'flex border-b border-slate-100'},
+        h('button',{onClick:()=>setView('profile'),className:`flex-1 py-2.5 text-xs font-medium transition-colors ${view==='profile'?'text-indigo-600 border-b-2 border-indigo-600':'text-slate-500'}`},'个人信息'),
+        user.role==='superadmin'&&h('button',{onClick:()=>{setView('admin');refreshData();},className:`flex-1 py-2.5 text-xs font-medium transition-colors ${view==='admin'?'text-indigo-600 border-b-2 border-indigo-600':'text-slate-500'}`},'后台管理')
+      ),
+
+      h('div',{className:'flex-1 overflow-y-auto p-4'},
+
+        // ── 个人信息 ──
+        view==='profile'&&h('div',{},
+          h('div',{className:'space-y-3 mb-5'},
+            [['用户名',user.username],['实名',user.realname||'—'],['手机',user.phone||'—'],['地址',user.address||'—'],['注册时间',(user.createdAt||'').slice(0,10)],['最后登录',(user.lastLogin||'—').slice(0,10)],['累计登录',`${user.loginCount||0} 次`]].map(([k,v])=>
+              h('div',{key:k,className:'flex justify-between py-2 border-b border-slate-50 text-sm'},
+                h('span',{className:'text-slate-500'},k),
+                h('span',{className:'font-medium text-slate-800'},v)
+              )
+            )
+          ),
+          h('div',{className:'mb-4'},
+            h('div',{className:'text-xs font-semibold text-slate-500 mb-2 uppercase tracking-wider'},'账户级别'),
+            h('div',{className:`inline-flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium ${roleBadgeClass(user.role)}`},
+              user.role==='superadmin'?'👑':user.role==='pro'?'⭐':'🔰',
+              roleLabel(user.role)
+            )
+          ),
+          // 基础版可申请升级
+          user.role==='basic'&&h('div',{className:'p-4 bg-amber-50 border border-amber-200 rounded-xl mb-4'},
+            h('div',{className:'font-semibold text-amber-800 text-sm mb-1'},'🚀 升级专业版'),
+            h('div',{className:'text-xs text-amber-700 mb-3'},'专业版可解锁「智能决策」功能，包含组合优化、概率研判等高级分析工具。'),
+            upgradeMsg&&h('div',{className:'text-xs mb-2 font-medium text-amber-800'},upgradeMsg),
+            h('button',{onClick:handleUpgradeRequest,className:'w-full py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-sm font-semibold transition-colors'},'申请升级专业版')
+          ),
+          h('button',{onClick:()=>{UM.logout(user.username);onLogout();},
+            className:'w-full py-2.5 border border-red-200 text-red-600 hover:bg-red-50 rounded-lg text-sm font-semibold transition-colors mt-2'},'退出登录')
+        ),
+
+        // ── 后台管理 ──
+        view==='admin'&&h('div',{},
+          // Admin tabs
+          h('div',{className:'flex gap-1 mb-4 bg-slate-100 p-1 rounded-lg'},
+            [['overview','📊 概览'],['users','👥 账户'],['upgrade','📋 升级审批'],['logs','📝 日志']].map(([id,l])=>
+              h('button',{key:id,onClick:()=>setAdminTab(id),className:`flex-1 text-xs py-1.5 rounded-md font-medium transition-colors ${adminTab===id?'bg-white text-indigo-600 shadow-sm':'text-slate-500'}`},l)
+            )
+          ),
+
+          // 概览BI
+          adminTab==='overview'&&h('div',{},
+            h('div',{className:'grid grid-cols-2 gap-3 mb-4'},
+              [['总账户',users.length,'👥','text-indigo-600','bg-indigo-50'],['近7日活跃',activeUsers,'✅','text-green-600','bg-green-50'],['累计登录',totalLogins,'🔑','text-amber-600','bg-amber-50'],['待审批',upgradeReqs.filter(r=>r.status==='pending').length,'⏳','text-purple-600','bg-purple-100']].map(([l,v,ic,tc,bc])=>
+                h('div',{key:l,className:`${bc} rounded-xl p-3`},
+                  h('div',{className:'flex items-center gap-2 mb-1'},h('span',{},ic),h('div',{className:'text-xs text-slate-500'},l)),
+                  h('div',{className:`text-2xl font-bold ${tc}`},v)
+                )
+              )
+            ),
+            // 账户角色分布
+            h('div',{className:'bg-slate-50 rounded-xl p-4 mb-4'},
+              h('div',{className:'font-semibold text-sm text-slate-700 mb-3'},'账户级别分布'),
+              (['superadmin','pro','basic']).map(r=>{
+                const cnt=users.filter(u=>u.role===r).length;
+                const pct=users.length?Math.round(cnt/users.length*100):0;
+                return h('div',{key:r,className:'mb-2'},
+                  h('div',{className:'flex justify-between text-xs mb-1'},
+                    h('span',{className:'text-slate-600'},roleLabel(r)),
+                    h('span',{className:'font-medium'},`${cnt} 人 (${pct}%)`)
+                  ),
+                  h('div',{className:'h-1.5 bg-slate-200 rounded-full overflow-hidden'},
+                    h('div',{className:`h-full rounded-full ${r==='superadmin'?'bg-purple-500':r==='pro'?'bg-amber-400':'bg-indigo-400'}`,style:{width:pct+'%'}})
+                  )
+                );
+              }),
+            ),
+            // 热门功能 Tab 访问统计
+            h('div',{className:'bg-slate-50 rounded-xl p-4'},
+              h('div',{className:'font-semibold text-sm text-slate-700 mb-3'},'功能页面访问热度'),
+              (() => {
+                const tabTotals = {};
+                users.forEach(u=>{ if(u.tabVisits) Object.entries(u.tabVisits).forEach(([k,v])=>tabTotals[k]=(tabTotals[k]||0)+v); });
+                const tabNames={data:'数据总控',validate:'数据契约',feature:'特征实验',model:'模型实验',backtest:'历史回测',dashboard:'量化看板',stat:'统计检验',decision:'智能决策',autopilot:'AutoPilot'};
+                const sorted=Object.entries(tabTotals).sort((a,b)=>b[1]-a[1]).slice(0,6);
+                const max=sorted[0]?.[1]||1;
+                return sorted.length?sorted.map(([k,v])=>
+                  h('div',{key:k,className:'mb-2'},
+                    h('div',{className:'flex justify-between text-xs mb-1'},
+                      h('span',{className:'text-slate-600'},tabNames[k]||k),
+                      h('span',{className:'font-medium'},v)
+                    ),
+                    h('div',{className:'h-1.5 bg-slate-200 rounded-full overflow-hidden'},
+                      h('div',{className:'h-full bg-indigo-400 rounded-full',style:{width:(v/max*100)+'%'}})
+                    )
+                  )
+                ):h('div',{className:'text-xs text-slate-400 text-center py-4'},'暂无访问数据')
+              })()
+            )
+          ),
+
+          // 账户管理
+          adminTab==='users'&&h('div',{},
+            users.map(u=>
+              h('div',{key:u.id,className:'border border-slate-100 rounded-xl p-3 mb-3'},
+                h('div',{className:'flex items-start justify-between mb-2'},
+                  h('div',{},
+                    h('div',{className:'font-semibold text-sm text-slate-800'},u.realname||u.username),
+                    h('div',{className:'text-xs text-slate-400'},`@${u.username} · ${u.phone||''}`)
+                  ),
+                  h('span',{className:`text-xs px-2 py-0.5 rounded-full font-medium ${roleBadgeClass(u.role)}`},roleLabel(u.role))
+                ),
+                h('div',{className:'text-xs text-slate-400 mb-3'},`最后登录: ${(u.lastLogin||'从未').slice(0,10)} · 登录${u.loginCount||0}次`),
+                u.role!=='superadmin'&&h('div',{className:'flex gap-2'},
+                  u.role==='basic'&&h('button',{onClick:()=>handleRoleChange(u.id,'pro'),className:'flex-1 py-1 text-xs bg-amber-50 text-amber-700 border border-amber-200 rounded-lg hover:bg-amber-100'},'升级专业版'),
+                  u.role==='pro'&&h('button',{onClick:()=>handleRoleChange(u.id,'basic'),className:'flex-1 py-1 text-xs bg-slate-50 text-slate-600 border border-slate-200 rounded-lg hover:bg-slate-100'},'降级基础版'),
+                  h('button',{onClick:()=>handleDelete(u.id),className:'py-1 px-3 text-xs bg-red-50 text-red-600 border border-red-200 rounded-lg hover:bg-red-100'},'删除')
+                )
+              )
+            )
+          ),
+
+          // 升级审批
+          adminTab==='upgrade'&&h('div',{},
+            upgradeReqs.length===0&&h('div',{className:'text-center py-8 text-sm text-slate-400'},'暂无升级申请'),
+            upgradeReqs.map((req,i)=>
+              h('div',{key:i,className:'border border-slate-100 rounded-xl p-3 mb-3'},
+                h('div',{className:'flex justify-between items-start mb-2'},
+                  h('div',{className:'font-semibold text-sm'},req.username),
+                  h('span',{className:`text-xs px-2 py-0.5 rounded-full ${req.status==='pending'?'bg-amber-100 text-amber-700':req.status==='approved'?'bg-green-100 text-green-700':'bg-red-100 text-red-600'}`},
+                    req.status==='pending'?'待审批':req.status==='approved'?'已批准':'已拒绝')
+                ),
+                h('div',{className:'text-xs text-slate-400 mb-3'},`申请时间: ${req.requestedAt.slice(0,10)}`),
+                req.status==='pending'&&h('div',{className:'flex gap-2'},
+                  h('button',{onClick:()=>handleApprove(req.username,true),className:'flex-1 py-1.5 text-xs bg-green-600 hover:bg-green-700 text-white rounded-lg'},'✅ 批准'),
+                  h('button',{onClick:()=>handleApprove(req.username,false),className:'flex-1 py-1.5 text-xs bg-red-50 text-red-600 border border-red-200 rounded-lg hover:bg-red-100'},'❌ 拒绝')
+                )
+              )
+            )
+          ),
+
+          // 操作日志
+          adminTab==='logs'&&h('div',{},
+            logs.length===0&&h('div',{className:'text-center py-8 text-sm text-slate-400'},'暂无日志'),
+            logs.map((log,i)=>
+              h('div',{key:i,className:'flex items-start gap-3 py-2 border-b border-slate-50'},
+                h('div',{className:'w-1.5 h-1.5 rounded-full bg-indigo-400 mt-1.5 flex-shrink-0'}),
+                h('div',{},
+                  h('div',{className:'text-xs text-slate-700'},h('span',{className:'font-medium'},log.username),' ',log.action),
+                  h('div',{className:'text-xs text-slate-400'},log.time.replace('T',' ').slice(0,19))
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  );
+}
+
+// ── 用户头像按钮（右上角）──
+function UserBadge({ user, onClick }) {
+  const roleColor = user.role==='superadmin'?'bg-purple-500':user.role==='pro'?'bg-amber-400':'bg-indigo-500';
+  return h('button',{onClick,className:`flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-slate-700/50 transition-colors group`,title:'账户中心'},
+    h('div',{className:`w-7 h-7 rounded-full ${roleColor} flex items-center justify-center text-white text-xs font-bold flex-shrink-0`},
+      (user.realname||user.username||'U')[0].toUpperCase()
+    ),
+    h('div',{className:'text-left hidden md:block'},
+      h('div',{className:'text-xs font-medium text-slate-300 leading-tight'},user.realname||user.username),
+      h('div',{className:'text-xs text-slate-500 leading-tight'},
+        user.role==='superadmin'?'超级管理员':user.role==='pro'?'专业版':'基础版')
+    ),
+    h('svg',{xmlns:'http://www.w3.org/2000/svg',width:12,height:12,viewBox:'0 0 24 24',fill:'none',stroke:'currentColor',strokeWidth:2.5,strokeLinecap:'round',strokeLinejoin:'round',className:'text-slate-500 flex-shrink-0'},
+      h('polyline',{points:'6 9 12 15 18 9'})
+    )
+  );
+}
+
 function App(){
+  // ── User state ──
+  const [currentUser, setCurrentUser] = useState(()=>UM.getSession());
+  const [showAccountPanel, setShowAccountPanel] = useState(false);
+
   const [tab,setTab]=useState('data');
   const [data,setData]=useState([]);
   const [report,setReport]=useState(null);
@@ -7619,22 +8513,49 @@ function App(){
   const [btRecs,setBtRecs]=useState([]);
   const [btSum,setBtSum]=useState(null);
 
+  // ── Hook 声明完毕，useEffect 紧跟其后 ──
   useEffect(()=>{
     if(data.length>0){const d=splitDataset(data,ratio);setData(d);setReport(generateReport(d));}
   },[ratio]);
+
+  // ── 以下可以有条件逻辑 ──
+  if(!currentUser){
+    return h(AuthPage, { onLogin: user => { setCurrentUser(user); UM.addLog(user.username,'进入平台'); } });
+  }
+
+  const role = currentUser.role;
+  const canDecision = role==='superadmin'||role==='pro';
+  const canAutopilot = role==='superadmin';
+
+  const handleTabChange = (id) => {
+    setTab(id);
+    UM.recordTabVisit(currentUser.username, id);
+    setCurrentUser(UM.getSession());
+  };
+
 
   const handleFile=e=>{
     const f=e.target.files?.[0];if(!f)return;
     setLoading(true);
     const r=new FileReader();
-    r.onload=ev=>{const raw=parseCSV(ev.target.result);const d=splitDataset(raw,ratio);setData(d);setReport(generateReport(d));setLoading(false);setTab('data');};
+    r.onload=ev=>{const raw=parseCSV(ev.target.result);const d=splitDataset(raw,ratio);setData(d);setReport(generateReport(d));setLoading(false);handleTabChange('data');};
     r.readAsText(f);
   };
 
-  const tabs=[{id:'data',l:'数据总控',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></svg>`},{id:'validate',l:'数据契约',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>`},{id:'feature',l:'特征实验',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 7 6.82 21.18a2.83 2.83 0 0 1-3.99-.01 2.83 2.83 0 0 1 0-4L17 3"/><path d="m16 2 6 6"/><path d="M12 16H4"/></svg>`},{id:'model',l:'模型实验',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96-.46 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 4.44-1.14"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96-.46 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-4.44-1.14"/></svg>`},{id:'backtest',l:'历史回测',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg>`},{id:'dashboard',l:'量化看板',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/><line x1="2" y1="20" x2="22" y2="20"/></svg>`},
-  {id:'stat',l:'统计检验',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>`},
-{id:'decision',l:'智能决策',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`},
-{id:'autopilot',l:'🤖 AutoPilot',icon:''}];
+  // 构建 tabs（按角色过滤）
+  const allTabs=[
+    {id:'data',l:'数据总控',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></svg>`},
+    {id:'validate',l:'数据契约',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>`},
+    {id:'feature',l:'特征实验',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 7 6.82 21.18a2.83 2.83 0 0 1-3.99-.01 2.83 2.83 0 0 1 0-4L17 3"/><path d="m16 2 6 6"/><path d="M12 16H4"/></svg>`},
+    {id:'model',l:'模型实验',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96-.46 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 4.44-1.14"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96-.46 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-4.44-1.14"/></svg>`},
+    {id:'backtest',l:'历史回测',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg>`},
+    {id:'dashboard',l:'量化看板',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/><line x1="2" y1="20" x2="22" y2="20"/></svg>`},
+    {id:'stat',l:'统计检验',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>`},
+    // 智能决策：始终显示tab，基础版灰化不可点击
+    {id:'decision',l:'智能决策',icon:`<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`, disabled:!canDecision, lockLabel:'专业版'},
+    // autopilot：只有 superadmin 才显示
+    ...(canAutopilot?[{id:'autopilot',l:'🤖 AutoPilot',icon:''}]:[])
+  ];
 
   return h('div',{className:'min-h-screen bg-slate-100 flex flex-col'},
     h('header',{className:'bg-slate-900 text-white shadow-lg sticky top-0 z-50'},
@@ -7647,21 +8568,32 @@ function App(){
           ),
           h('div',{},
             h('div',{className:'text-base font-bold tracking-tight leading-tight'},'SSQ 量化预测系统'),
-            h('div',{className:'text-xs text-indigo-400 font-mono leading-tight'},'v1.5.6-autopilot-lstm')
+            h('div',{className:'text-xs text-indigo-400 font-mono leading-tight'},'v1.5.7-almost')
           )
         ),
         h('nav',{className:'tab-scroll flex items-center space-x-1 bg-slate-800/80 p-1 rounded-xl border border-slate-700/50'},
-          tabs.map(t=>h('button',{key:t.id,onClick:()=>setTab(t.id),
-            className:`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition-all duration-150 ${tab===t.id?'bg-indigo-600 text-white shadow-sm':'text-slate-400 hover:text-slate-200 hover:bg-slate-700/50'}`
-          },
-            t.icon&&h('span',{dangerouslySetInnerHTML:{__html:t.icon},className:'flex-shrink-0',style:{display:'inline-flex',alignItems:'center'}}),
-            t.l
-          ))
+          allTabs.map(t=>{
+            const isActive = tab===t.id;
+            const isDisabled = !!t.disabled;
+            return h('button',{key:t.id,
+              onClick:isDisabled?undefined:()=>handleTabChange(t.id),
+              title:isDisabled?`🔒 ${t.lockLabel||''}功能解锁`:t.l,
+              className:`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition-all duration-150 ${isActive?'bg-indigo-600 text-white shadow-sm':isDisabled?'text-slate-600 cursor-not-allowed opacity-60':'text-slate-400 hover:text-slate-200 hover:bg-slate-700/50'}`
+            },
+              t.icon&&h('span',{dangerouslySetInnerHTML:{__html:t.icon},className:'flex-shrink-0',style:{display:'inline-flex',alignItems:'center'}}),
+              t.l,
+              isDisabled&&h('span',{className:'ml-1 text-xs opacity-70'},'🔒')
+            )
+          })
         ),
-        h('button',{onClick:()=>openManual(),
-          className:'ml-2 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:text-white hover:bg-slate-700/60 border border-slate-700/60 transition-all whitespace-nowrap flex-shrink-0',
-          title:'打开操作手册'},
-          h('span',{},'📖'), '手册'
+        // 右侧：手册按钮 + 用户头像
+        h('div',{className:'flex items-center gap-2 flex-shrink-0'},
+          h('button',{onClick:()=>openManual(),
+            className:'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:text-white hover:bg-slate-700/60 border border-slate-700/60 transition-all whitespace-nowrap',
+            title:'打开操作手册'},
+            h('span',{},'📖'), '手册'
+          ),
+          h(UserBadge,{user:currentUser, onClick:()=>setShowAccountPanel(true)})
         )
       )
     ),
@@ -7696,10 +8628,29 @@ function App(){
         tab==='backtest'&&(data.length>0?h(BacktestLab,{data,records:btRecs,setRecords:setBtRecs,summary:btSum,setSummary:setBtSum,externalModel:model,setExternalModel:setModel}):h('div',{className:'text-center py-20 text-slate-400 bg-white rounded-lg border border-dashed'},'请先上传数据')),
         tab==='dashboard'&&h(Dashboard,{data:data.filter(d=>d.usage==='train'),btSum,stratResult}),
         tab==='stat'&&(data.length>0?h(StatLab,{data}):h('div',{className:'text-center py-20 text-slate-400 bg-white rounded-lg border border-dashed'},'请先上传数据')),
-        tab==='decision'&&h(DecisionLab,{data,activeModel:model,inferenceResult:infResult,trainSplit:ratio,btSum,btRecs}),
-        tab==='autopilot'&&h(AutoPilotTab,{data,trainSplit:ratio})
+        // 智能决策：基础版显示锁定提示
+        tab==='decision'&&(canDecision
+          ? h(DecisionLab,{data,activeModel:model,inferenceResult:infResult,trainSplit:ratio,btSum,btRecs})
+          : h('div',{className:'flex flex-col items-center justify-center py-20 text-center'},
+              h('div',{className:'text-5xl mb-4'},'🔒'),
+              h('div',{className:'text-xl font-bold text-slate-700 mb-2'},'智能决策 — 专业版功能'),
+              h('div',{className:'text-slate-500 mb-6 max-w-md'},'智能决策模块包含组合优化、概率研判等高级分析工具，需升级专业版账户后解锁。'),
+              h('button',{onClick:()=>setShowAccountPanel(true),className:'px-6 py-2.5 bg-amber-500 hover:bg-amber-600 text-white rounded-xl font-semibold transition-colors'},'申请升级专业版')
+            )
+        ),
+        // AutoPilot 始终挂载，切换tab时用display:none隐藏，保持内部所有状态不丢失
+        canAutopilot&&h('div',{style:{display:tab==='autopilot'?'block':'none'}},
+          h(AutoPilotTab,{data,trainSplit:ratio,activeModel:model})
+        )
       )
-    )
+    ),
+    // 账户面板
+    showAccountPanel&&h(AccountPanel,{
+      user:currentUser,
+      onClose:()=>setShowAccountPanel(false),
+      onLogout:()=>{ setCurrentUser(null); setShowAccountPanel(false); },
+      onUserUpdate:updatedUser=>{ setCurrentUser(updatedUser||UM.getSession()); }
+    })
   );
 }
 
