@@ -83,5 +83,27 @@ export async function onRequest(context) {
     return ok({}, '密码修改成功');
   }
 
+  // GET /api/user/data?type=bt_history|ai_history  — 拉取用户本地历史数据备份
+  if (path.endsWith('/data') && request.method === 'GET') {
+    const type = new URL(request.url).searchParams.get('type') || 'bt_history';
+    if (!['bt_history', 'ai_history'].includes(type)) return err('无效的type');
+    const key = `userdata:${td.username}:${type}`;
+    const raw = await kv.get(key);
+    return ok({ data: raw ? raw : null });
+  }
+
+  // POST /api/user/data  — 保存用户本地历史数据到KV（JSON字符串，最大500KB）
+  if (path.endsWith('/data') && request.method === 'POST') {
+    let body; try { body = await request.json(); } catch { return err('Invalid JSON'); }
+    const { type, data } = body;
+    if (!type || !['bt_history', 'ai_history'].includes(type)) return err('无效的type');
+    if (typeof data !== 'string') return err('data必须是JSON字符串');
+    if (data.length > 512000) return err('数据超过500KB上限');
+    const key = `userdata:${td.username}:${type}`;
+    // 保存365天
+    await kv.put(key, data, { expirationTtl: 60 * 60 * 24 * 365 });
+    return ok({}, 'OK');
+  }
+
   return err('Not Found', 404);
 }
