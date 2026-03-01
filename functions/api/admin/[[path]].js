@@ -22,11 +22,12 @@ async function hashPwd(password) {
 async function getTokenData(kv, request) {
   const auth = request.headers.get('Authorization') || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-  if (!token) return null;
+  if (!token) return { error: '未携带 Authorization Token，请重新登录' };
   const raw = await kv.get(`token:${token}`);
-  if (!raw) return null;
-  const td = JSON.parse(raw);
-  if (Date.now() > td.expires) { await kv.delete(`token:${token}`); return null; }
+  if (!raw) return { error: 'Token 在服务器不存在，请重新登录（或 KV 未绑定）' };
+  let td;
+  try { td = JSON.parse(raw); } catch { return { error: 'Token 数据损坏，请重新登录' }; }
+  if (Date.now() > td.expires) { await kv.delete(`token:${token}`); return { error: 'Token 已过期，请重新登录' }; }
   return td;
 }
 
@@ -64,11 +65,11 @@ export async function onRequest(context) {
   const { request, env } = context;
   if (request.method === 'OPTIONS') return opts();
 
-  const kv = SSQ_KV;
+  const kv = (typeof env !== "undefined" ? env.SSQ_KV : null) || SSQ_KV;
   if (!kv) return err('KV Storage not configured', 500);
 
   const td = await getTokenData(kv, request);
-  if (!td) return err('未登录或 Token 已过期', 401);
+  if (td.error) return err(td.error, 401);
 
   const url = new URL(request.url);
   const path = url.pathname;
