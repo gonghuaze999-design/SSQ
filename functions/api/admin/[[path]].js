@@ -65,7 +65,9 @@ export async function onRequest(context) {
   const { request, env } = context;
   if (request.method === 'OPTIONS') return opts();
 
-  const kv = (typeof env !== "undefined" ? env.SSQ_KV : null) || SSQ_KV;
+  let kv = null;
+  try { kv = env?.SSQ_KV || null; } catch(e) {}
+  try { if (!kv) kv = SSQ_KV; } catch(e) {}
   if (!kv) return err('KV Storage not configured', 500);
 
   const td = await getTokenData(kv, request);
