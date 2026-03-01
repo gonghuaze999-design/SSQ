@@ -21,7 +21,7 @@ export async function onRequest(context) {
   if (request.method === 'OPTIONS') return opts();
   if (request.method !== 'POST') return err('Method not allowed', 405);
 
-  const kv = SSQ_KV;
+  const kv = (typeof env !== "undefined" ? env.SSQ_KV : null) || SSQ_KV;
   if (!kv) return err('KV Storage not configured', 500);
 
   let body;
