@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>SSQ 诊断</title>
+<style>
+body{font-family:monospace;padding:20px;background:#1a1a2e;color:#eee}
+.box{background:#16213e;padding:15px;border-radius:8px;margin:10px 0;white-space:pre-wrap;word-break:break-all}
+button{background:#7c83fd;color:white;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;margin:5px;font-size:14px}
+</style>
+</head>
+<body>
+<h2>SSQ 诊断工具</h2>
+<button onclick="testShort()">短Prompt（正确格式）</button>
+<button onclick="testLong()">长Prompt 1050字符（正确格式）</button>
+<div class="box" id="result">点击按钮测试</div>
+<script>
+const TOKEN_KEY = 'ssq_token_v1';
+const LONG = '测试数据行'.repeat(200) + '请生成报告';
+
+async function send(prompt) {
+  const token = localStorage.getItem(TOKEN_KEY);
+  const encoded = btoa(unescape(encodeURIComponent(prompt)));
+  const bodyStr = JSON.stringify({ data: encoded });
+  document.getElementById('result').textContent = '请求中... 原始=' + prompt.length + '字符 encoded=' + encoded.length + '字节';
+  try {
+    const res = await fetch('/api/deepseek', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (token||'') },
+      body: bodyStr
+    });
+    const text = await res.text();
+    document.getElementById('result').textContent = 'Status: ' + res.status + '\n原始: ' + prompt.length + '字符\nencoded: ' + encoded.length + '字节\n\n' + text.slice(0, 500);
+  } catch(e) {
+    document.getElementById('result').textContent = '异常: ' + e.message;
+  }
+}
+
+function testShort() { send('用一句话介绍你自己'); }
+function testLong() { send(LONG); }
+</script>
+</body>
+</html>
