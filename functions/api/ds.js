@@ -1,6 +1,5 @@
-// POST /api/deepseek - 代理转发 DeepSeek API 请求（key内置）
-// Body: { promptData: {...} }  — 前端发送结构化数据，服务端拼接prompt（绕过WAF字符限制）
-// 兼容旧格式: { contents: [{parts: [{text: string}]}] }
+// POST /api/ds - 代理转发 DeepSeek API 请求（key内置，SSE流式输出）
+// Body: { promptData: {...} }  — 前端发送结构化数据，服务端拼接prompt
 
 const DEEPSEEK_API_KEY = 'sk-c648e93d82474a0880eda01639b1965f';
 const DEFAULT_MODEL = 'deepseek-chat';
@@ -17,7 +16,6 @@ function jsonRes(data, status = 200) {
     headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
   });
 }
-const ok = (data) => jsonRes({ code: 0, message: 'success', data });
 const err = (msg, status = 400) => jsonRes({ code: -1, message: msg, data: null }, status);
 const opts = () => new Response(null, { status: 204, headers: CORS_HEADERS });
 
@@ -42,14 +40,43 @@ function buildSsqAnalysisPrompt(d) {
 [近50期统计] 热号Top8:${d.hotReds} | 冷号Bottom8:${d.coldReds} | 热蓝Top5:${d.hotBlue} | 冷蓝Bottom5:${d.coldBlue} | 红球和值均值:${d.avgSum}(理论≈102) | 跨度均值:${d.avgSpan}(理论≈27)
 ${d.modelSection}
 ${d.btSection} ${d.histBtSection}
-请按以下6个维度输出中文分析报告，每个维度用[序号.标题]开头，内容简洁：
-[1.市场博弈环境] 奖池积累程度、拥挤度信号、历史同类规律，100字以内
-[2.数据信号解读] 热冷号统计、和值跨度、LSTM概率分布综合，150字以内
-[3.回测绩效评估] ROI/RTP趋势、最大回撤、中奖率，综合评级:优/良/一般/差，100字以内
-[4.本期操作结论] 参与建议(强烈参与/正常参与/谨慎参与/建议跳过) | 投注模式(胆拖/复式/单式) | 胆码红球2-3个 | 拖码4-8个 | 蓝球1-2个 | 建议投入(参考预算基准¥${d.baseBudget}×象限系数) | 预期命中层级 | 风险提示一句话
-[5.资金管理] 单期投入上限 | 回本周期估算(基于RTP和中奖率) | 资金平衡点(累计投入Y元期望回收Z元) | 止损阈值 | 娱乐定位提醒
-[6.下期观察指标] 列出3个具体数据阈值(奖池/销售额/拥挤度)
----注意:本报告基于历史统计与模型分析，不构成购彩建议。双色球为随机游戏，长期期望收益为负(RTP≈50%)，请理性娱乐。---`;
+请严格按以下markdown格式输出中文分析报告，使用##标题，不要用[序号]括号格式：
+
+# 双色球${d.nextIssue}期 量化研判报告
+
+## 一、市场博弈环境研判
+（请分析奖池积累程度、拥挤度信号、历史同类规律，100字以内）
+
+## 二、数据信号综合解读
+（请综合热冷号统计、和值跨度、LSTM概率分布，150字以内）
+
+## 三、历史回测绩效评估
+（请分析ROI/RTP趋势、最大回撤、中奖率，末尾给出综合评级：**优/良/一般/差**，100字以内）
+
+## 四、💡 本期操作结论（重点）
+**参与建议**：（积极/谨慎/观望）
+**推荐投注模式**：（胆拖/复式/单式，说明理由）
+**核心选号方案**：
+- 胆码红球（最高置信度，2-3个必选）：
+- 拖码/扩展红球（4-8个）：
+- 蓝球推荐（1-2个）：
+**本期建议投入金额**：¥xxx（预算基准¥${d.baseBudget}×象限系数）
+**预期命中层级**：
+**风险提示**：
+
+## 五、💰 资金管理建议
+**单期投入上限**：建议不超过可支配娱乐预算的5%
+**回本周期估算**：（基于RTP和中奖率估算）
+**止损建议**：连续亏损超过3期或累计亏损超过投入本金50%时建议停止
+**娱乐化定位**：彩票本质是娱乐消费，期望值为负，理性参与
+
+## 六、下期重点观察指标
+- 奖池阈值：（具体数值）
+- 销售额阈值：（具体数值）
+- 拥挤度阈值：（具体描述）
+
+---
+⚠️ 免责声明：本报告基于历史统计与模型分析，不构成购彩建议。双色球为随机游戏，长期期望收益为负（RTP≈50%），请理性娱乐。`;
 }
 
 // 服务端拼接AutoPilot prompt
@@ -91,16 +118,10 @@ export async function onRequest(context) {
   let body;
   try { body = await request.json(); } catch { return err('Invalid JSON'); }
 
-  const { promptData, contents, b64, model = DEFAULT_MODEL } = body;
+  const { promptData, model = DEFAULT_MODEL } = body;
 
   let prompt = '';
-  if (b64) {
-    try {
-      prompt = decodeURIComponent(escape(atob(b64)));
-    } catch(e) {
-      return err('base64解码失败');
-    }
-  } else if (promptData) {
+  if (promptData) {
     if (promptData.type === 'ssq_analysis') {
       prompt = buildSsqAnalysisPrompt(promptData);
     } else if (promptData.type === 'ssq_autopilot') {
@@ -108,8 +129,6 @@ export async function onRequest(context) {
     } else {
       return err('未知的promptData类型');
     }
-  } else if (contents && Array.isArray(contents)) {
-    prompt = contents?.[0]?.parts?.[0]?.text;
   }
 
   if (!prompt) return err('缺少 prompt');
@@ -127,22 +146,28 @@ export async function onRequest(context) {
         messages: [{ role: 'user', content: prompt }],
         max_tokens: 8192,
         temperature: 0.6,
+        stream: true,
       }),
     });
   } catch (e) {
     return err(`代理请求失败: ${e.message}`, 502);
   }
 
-  const respBody = await dsResp.text();
-  let parsed;
-  try { parsed = JSON.parse(respBody); } catch { return err('DeepSeek返回解析失败', 502); }
-
   if (!dsResp.ok) {
+    const errText = await dsResp.text();
+    let parsed;
+    try { parsed = JSON.parse(errText); } catch {}
     return err(parsed?.error?.message || 'DeepSeek API错误', dsResp.status);
   }
 
-  const text = parsed?.choices?.[0]?.message?.content || '';
-  if (!text) return err('DeepSeek返回内容为空', 502);
-
-  return ok({ text });
+  // 直接透传SSE流
+  return new Response(dsResp.body, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'X-Accel-Buffering': 'no',
+      ...CORS_HEADERS,
+    },
+  });
 }
