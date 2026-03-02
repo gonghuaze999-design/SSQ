@@ -59,7 +59,7 @@ export async function onRequest(context) {
       body: JSON.stringify({
         model,
         messages: [{ role: 'user', content: prompt }],
-        max_tokens: 8192,
+        max_tokens: 2048,
         temperature: 0.6,
       }),
     });
