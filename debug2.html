@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>SSQ API 诊断 v2</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Courier New', monospace; background: #0d1117; color: #c9d1d9; min-height: 100vh; padding: 24px; }
+  h1 { color: #58a6ff; font-size: 18px; margin-bottom: 4px; letter-spacing: 1px; }
+  .subtitle { color: #6e7681; font-size: 12px; margin-bottom: 24px; }
+
+  .section { margin-bottom: 20px; }
+  .section-title { color: #8b949e; font-size: 11px; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 10px; border-bottom: 1px solid #21262d; padding-bottom: 6px; }
+
+  .btn-grid { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  button {
+    background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+    padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 12px;
+    font-family: 'Courier New', monospace; transition: all 0.15s;
+  }
+  button:hover { background: #30363d; border-color: #58a6ff; color: #58a6ff; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; color: white; }
+  button.primary:hover { background: #388bfd; }
+  button.danger { background: #da3633; border-color: #da3633; color: white; }
+  button.danger:hover { background: #f85149; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .result-box {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 14px; min-height: 60px; white-space: pre-wrap; word-break: break-all;
+    font-size: 12px; line-height: 1.6; max-height: 300px; overflow-y: auto;
+  }
+  .result-box.success { border-color: #2ea043; }
+  .result-box.error { border-color: #f85149; }
+  .result-box.warning { border-color: #d29922; }
+
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; margin-right: 6px; }
+  .tag-200 { background: #0d4429; color: #3fb950; }
+  .tag-502 { background: #3d1a00; color: #d29922; }
+  .tag-545 { background: #3d0000; color: #f85149; }
+  .tag-401 { background: #2d1a4e; color: #a371f7; }
+  .tag-other { background: #21262d; color: #8b949e; }
+
+  .log-area {
+    background: #0d1117; border: 1px solid #21262d; border-radius: 8px;
+    padding: 12px; height: 200px; overflow-y: auto; font-size: 11px; line-height: 1.8;
+  }
+  .log-entry { margin-bottom: 2px; }
+  .log-entry .time { color: #6e7681; }
+  .log-entry .ok { color: #3fb950; }
+  .log-entry .fail { color: #f85149; }
+  .log-entry .warn { color: #d29922; }
+  .log-entry .info { color: #58a6ff; }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .stat-card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px; }
+  .stat-num { font-size: 28px; font-weight: bold; color: #58a6ff; }
+  .stat-label { font-size: 11px; color: #6e7681; margin-top: 2px; }
+
+  textarea {
+    width: 100%; background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+    color: #c9d1d9; padding: 10px; font-family: 'Courier New', monospace; font-size: 11px;
+    resize: vertical; margin-top: 6px;
+  }
+
+  .separator { height: 1px; background: #21262d; margin: 20px 0; }
+  .inline-status { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot-green { background: #3fb950; }
+  .dot-red { background: #f85149; }
+  .dot-grey { background: #6e7681; }
+  .dot-yellow { background: #d29922; }
+
+  #progress { color: #58a6ff; font-size: 12px; margin-top: 8px; min-height: 18px; }
+</style>
+</head>
+<body>
+
+<h1>⚡ SSQ API 诊断工具 v2</h1>
+<p class="subtitle">专项诊断 DeepSeek 545 / Gemini 502 问题</p>
+
+<!-- Token状态 -->
+<div class="section">
+  <div class="section-title">🔑 登录状态</div>
+  <div id="token-status" class="result-box">检测中...</div>
+  <div class="btn-grid" style="margin-top:8px">
+    <button onclick="checkToken()">刷新Token状态</button>
+    <input id="token-input" placeholder="手动粘贴Token（可选）" style="background:#161b22;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;padding:6px 10px;font-size:12px;width:300px;">
+    <button onclick="setManualToken()">设置Token</button>
+  </div>
+</div>
+
+<div class="separator"></div>
+
+<!-- 核心诊断：路径对比 -->
+<div class="section">
+  <div class="section-title">🔬 核心诊断：同prompt打两个端点</div>
+  <p style="font-size:12px;color:#6e7681;margin-bottom:10px">用完全相同的短prompt，同时打 /api/deepseek 和 /api/gemini，对比结果。如果deepseek=545而gemini能进Function，说明WAF规则是路径级别的。</p>
+  <div class="btn-grid">
+    <button class="primary" onclick="testBothShort()">🚀 短Prompt同时打两端点</button>
+    <button onclick="testBothMedium()">📄 中等Prompt（含中文数据）同时打两端点</button>
+  </div>
+  <div id="progress"></div>
+  <div class="grid2" style="margin-top:10px">
+    <div>
+      <div style="font-size:11px;color:#8b949e;margin-bottom:6px">DeepSeek /api/deepseek</div>
+      <div id="result-ds" class="result-box">等待测试...</div>
+    </div>
+    <div>
+      <div style="font-size:11px;color:#8b949e;margin-bottom:6px">Gemini /api/gemini</div>
+      <div id="result-gm" class="result-box">等待测试...</div>
+    </div>
+  </div>
+</div>
+
+<div class="separator"></div>
+
+<!-- DeepSeek 精细测试 -->
+<div class="section">
+  <div class="section-title">🎯 DeepSeek 精细测试（逐步排查）</div>
+  <div class="btn-grid">
+    <button onclick="dsTest('极短', '你好')">1. 极短（2字）</button>
+    <button onclick="dsTest('纯ASCII', 'hello world, test 123')">2. 纯ASCII</button>
+    <button onclick="dsTest('短中文', '用一句话介绍双色球')">3. 短中文</button>
+    <button onclick="dsTest('中文重复', '测试行'.repeat(50))">4. 重复中文×50</button>
+    <button onclick="dsTest('数字列表', '2026001:[01,02,03,04,05,06+07] | 2026002:[08,09,10,11,12,13+14]')">5. 期号单行格式</button>
+    <button onclick="dsTest('多行期号', buildMultilineTest())">6. 多行期号格式（旧格式）</button>
+    <button onclick="dsTestNoAuth()">7. 无Token（401测试）</button>
+  </div>
+  <div id="result-ds-detail" class="result-box" style="margin-top:8px">点击上方按钮测试...</div>
+</div>
+
+<div class="separator"></div>
+
+<!-- 请求体格式测试 -->
+<div class="section">
+  <div class="section-title">📦 请求体格式测试</div>
+  <p style="font-size:12px;color:#6e7681;margin-bottom:10px">测试不同的请求体结构是否影响WAF</p>
+  <div class="btn-grid">
+    <button onclick="dsTestFormat('gemini格式带model', buildGeminiFormat())">Gemini完整格式（含key/model/generationConfig）</button>
+    <button onclick="dsTestFormat('最简格式', JSON.stringify({contents:[{parts:[{text:'你好'}]}]}))">最简contents格式</button>
+    <button onclick="dsTestFormat('plain text格式', JSON.stringify({prompt:'你好'}))">plain {prompt}格式</button>
+  </div>
+  <div id="result-format" class="result-box" style="margin-top:8px">点击上方按钮测试...</div>
+</div>
+
+<div class="separator"></div>
+
+<!-- 自定义测试 -->
+<div class="section">
+  <div class="section-title">✏️ 自定义Prompt测试</div>
+  <div class="btn-grid">
+    <button onclick="sendCustom('deepseek')">发送到 DeepSeek</button>
+    <button onclick="sendCustom('gemini')">发送到 Gemini</button>
+  </div>
+  <textarea id="custom-prompt" rows="6" placeholder="在此输入自定义prompt，点击上方按钮发送...">2026005:[03,08,12,19,24,31+07] | 2026006:[01,05,11,16,22,28+03] | 2026007:[02,07,13,18,25,30+09]
+热号Top8: 7(12次) 15(11次) 23(10次) 3(9次) 19(9次) 28(8次) 11(8次) 6(7次)
+请基于以上数据，简要分析下期选号策略（50字以内）</textarea>
+  <div id="result-custom" class="result-box" style="margin-top:8px">等待发送...</div>
+</div>
+
+<div class="separator"></div>
+
+<!-- 日志 -->
+<div class="section">
+  <div class="section-title">📋 测试日志</div>
+  <div class="log-area" id="log"></div>
+  <div class="btn-grid" style="margin-top:8px">
+    <button onclick="clearLog()">清空日志</button>
+    <button onclick="copyLog()">复制日志</button>
+  </div>
+</div>
+
+<script>
+const TOKEN_KEY = 'ssq_token_v1';
+let logEntries = [];
+
+function getToken() {
+  return localStorage.getItem(TOKEN_KEY) || '';
+}
+
+function setManualToken() {
+  const v = document.getElementById('token-input').value.trim();
+  if (v) { localStorage.setItem(TOKEN_KEY, v); checkToken(); addLog('手动设置Token: ' + v.slice(0,8) + '...', 'info'); }
+}
+
+function checkToken() {
+  const t = getToken();
+  const el = document.getElementById('token-status');
+  if (!t) {
+    el.textContent = '❌ 未找到Token（ssq_token_v1）\n请先在主页面登录，或手动粘贴Token';
+    el.className = 'result-box error';
+  } else {
+    el.textContent = '✅ Token存在: ' + t.slice(0,8) + '...' + t.slice(-4) + '\n（共' + t.length + '字符）\n\n注意：Token可能已过期，如果测试返回401请重新登录后刷新此页面';
+    el.className = 'result-box success';
+  }
+}
+
+function addLog(msg, type='info') {
+  const t = new Date().toTimeString().slice(0,8);
+  logEntries.push({t, msg, type});
+  const el = document.getElementById('log');
+  el.innerHTML = logEntries.slice(-50).reverse().map(e =>
+    `<div class="log-entry"><span class="time">[${e.t}]</span> <span class="${e.type}">${e.msg}</span></div>`
+  ).join('');
+}
+
+function clearLog() { logEntries = []; document.getElementById('log').innerHTML = ''; }
+function copyLog() {
+  const text = logEntries.map(e => `[${e.t}] ${e.msg}`).join('\n');
+  navigator.clipboard.writeText(text).then(() => addLog('日志已复制到剪贴板', 'info'));
+}
+
+function statusTag(code) {
+  const map = {200:'tag-200', 502:'tag-502', 545:'tag-545', 401:'tag-401'};
+  return `<span class="tag ${map[code]||'tag-other'}">${code}</span>`;
+}
+
+async function apiSend(endpoint, body, token) {
+  const t = token !== undefined ? token : getToken();
+  const start = Date.now();
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + t
+      },
+      body: typeof body === 'string' ? body : JSON.stringify(body)
+    });
+    const text = await res.text();
+    const ms = Date.now() - start;
+    return { status: res.status, text, ms };
+  } catch(e) {
+    return { status: 'ERR', text: e.message, ms: Date.now() - start };
+  }
+}
+
+function renderResult(elId, label, result, promptLen) {
+  const el = document.getElementById(elId);
+  const preview = result.text.slice(0, 500);
+  let cls = 'result-box';
+  if (result.status === 200) cls += ' success';
+  else if (result.status === 545 || result.status === 'ERR') cls += ' error';
+  else cls += ' warning';
+
+  el.innerHTML = `${statusTag(result.status)} ${label}  ${result.ms}ms  prompt:${promptLen}字符\n\n${preview}${result.text.length > 500 ? '\n...(截断)' : ''}`;
+  el.className = cls;
+  addLog(`${label} → ${result.status} (${result.ms}ms, ${promptLen}字符)`, result.status===200?'ok':result.status===545?'fail':'warn');
+}
+
+// ── 核心诊断：同时打两个端点 ──────────────────────────
+async function testBothShort() {
+  const prompt = '用一句话介绍双色球彩票规则';
+  await testBoth(prompt, '短Prompt');
+}
+
+async function testBothMedium() {
+  const prompt = `2026005:[03,08,12,19,24,31+07] | 2026006:[01,05,11,16,22,28+03] | 2026007:[02,07,13,18,25,30+09] | 2026008:[04,06,14,20,26,32+11]
+热号Top8: 7(12次) 15(11次) 23(10次) | 冷号: 2(2次) 9(3次) 17(3次)
+请分析规律`;
+  await testBoth(prompt, '中等Prompt含中文数据');
+}
+
+async function testBoth(prompt, label) {
+  document.getElementById('progress').textContent = '⏳ 测试中...';
+  document.getElementById('result-ds').textContent = '请求中...';
+  document.getElementById('result-gm').textContent = '请求中...';
+  addLog(`=== 开始对比测试: ${label} (${prompt.length}字符) ===`, 'info');
+
+  const body = { contents: [{ parts: [{ text: prompt }] }] };
+  const geminiBody = { key: 'NO_KEY_TEST', model: 'gemini-2.5-flash', contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 100, temperature: 0.6 } };
+
+  const [dsRes, gmRes] = await Promise.all([
+    apiSend('/api/deepseek', body),
+    apiSend('/api/gemini', geminiBody)
+  ]);
+
+  renderResult('result-ds', '/api/deepseek', dsRes, prompt.length);
+  renderResult('result-gm', '/api/gemini', gmRes, prompt.length);
+
+  const conclusion = dsRes.status === 545 && gmRes.status !== 545
+    ? '⚠️ 结论：DeepSeek被WAF拦(545)，Gemini未被拦 → WAF规则可能针对路径/api/deepseek'
+    : dsRes.status === 545 && gmRes.status === 545
+    ? '📌 结论：两个端点都被WAF拦(545) → WAF规则针对请求体内容（prompt）'
+    : dsRes.status !== 545 && gmRes.status !== 545
+    ? '✅ 结论：两个端点都通过WAF → 问题不在WAF层面'
+    : `📊 结论：DS=${dsRes.status} GM=${gmRes.status}，需要进一步分析`;
+
+  document.getElementById('progress').textContent = conclusion;
+  addLog(conclusion, 'info');
+}
+
+// ── DeepSeek 精细测试 ──────────────────────────────────
+async function dsTest(label, prompt) {
+  addLog(`DS测试[${label}]: ${prompt.length}字符`, 'info');
+  document.getElementById('result-ds-detail').textContent = `测试中: ${label}...`;
+  const res = await apiSend('/api/deepseek', { contents: [{ parts: [{ text: prompt }] }] });
+  renderResult('result-ds-detail', `[${label}] /api/deepseek`, res, prompt.length);
+}
+
+async function dsTestNoAuth() {
+  addLog('DS测试[无Token]', 'info');
+  document.getElementById('result-ds-detail').textContent = '测试中（无Token）...';
+  const res = await apiSend('/api/deepseek', { contents: [{ parts: [{ text: '你好' }] }] }, '');
+  renderResult('result-ds-detail', '[无Token] /api/deepseek', res, 2);
+}
+
+async function dsTestFormat(label, bodyStr) {
+  addLog(`格式测试[${label}]`, 'info');
+  document.getElementById('result-format').textContent = `测试中: ${label}...`;
+  const res = await apiSend('/api/deepseek', bodyStr);
+  renderResult('result-format', `[${label}] /api/deepseek`, res, bodyStr.length);
+}
+
+// ── 自定义测试 ──────────────────────────────────────────
+async function sendCustom(target) {
+  const prompt = document.getElementById('custom-prompt').value;
+  if (!prompt.trim()) { alert('请输入prompt'); return; }
+  addLog(`自定义测试 → ${target}: ${prompt.length}字符`, 'info');
+  document.getElementById('result-custom').textContent = '发送中...';
+
+  let body, endpoint;
+  if (target === 'deepseek') {
+    endpoint = '/api/deepseek';
+    body = { contents: [{ parts: [{ text: prompt }] }] };
+  } else {
+    endpoint = '/api/gemini';
+    body = { key: 'NO_KEY_TEST', model: 'gemini-2.5-flash', contents: [{ parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 200, temperature: 0.6 } };
+  }
+
+  const res = await apiSend(endpoint, body);
+  renderResult('result-custom', endpoint, res, prompt.length);
+}
+
+// ── 辅助函数 ────────────────────────────────────────────
+function buildMultilineTest() {
+  return [
+    '2026001期: 红球 03 08 12 19 24 31  蓝球 07',
+    '2026002期: 红球 01 05 11 16 22 28  蓝球 03',
+    '2026003期: 红球 02 07 13 18 25 30  蓝球 09',
+    '2026004期: 红球 04 06 14 20 26 32  蓝球 11',
+    '2026005期: 红球 09 10 15 21 27 33  蓝球 05',
+    '2026006期: 红球 08 12 17 23 29 31  蓝球 16',
+    '2026007期: 红球 03 11 16 22 28 30  蓝球 02',
+    '2026008期: 红球 06 09 14 19 25 33  蓝球 08',
+    '2026009期: 红球 01 07 13 20 26 32  蓝球 14',
+    '2026010期: 红球 04 08 12 18 24 30  蓝球 06',
+  ].join('\n') + '\n请分析规律';
+}
+
+function buildGeminiFormat() {
+  return JSON.stringify({
+    key: 'NO_KEY_TEST',
+    model: 'gemini-2.5-flash',
+    contents: [{ parts: [{ text: '你好' }] }],
+    generationConfig: { maxOutputTokens: 100, temperature: 0.6 }
+  });
+}
+
+// 初始化
+checkToken();
+addLog('诊断工具已加载', 'info');
+</script>
+</body>
+</html>
