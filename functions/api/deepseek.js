@@ -1,5 +1,5 @@
 // POST /api/deepseek - 代理转发 DeepSeek API 请求（key内置）
-// Body: { prompt: string }
+// Body: { contents: [{parts: [{text: string}]}] }  — 与 /api/gemini 相同的请求格式
 
 const DEEPSEEK_API_KEY = 'sk-c648e93d82474a0880eda01639b1965f';
 const DEFAULT_MODEL = 'deepseek-chat';
@@ -48,8 +48,11 @@ export async function onRequest(context) {
   let body;
   try { body = await request.json(); } catch { return err('Invalid JSON'); }
 
-  const { prompt, model = DEFAULT_MODEL } = body;
-  if (!prompt) return err('缺少 prompt');
+  // 从Gemini格式的嵌套结构中解包prompt
+  const { contents, model = DEFAULT_MODEL } = body;
+  if (!contents || !Array.isArray(contents)) return err('缺少 contents');
+  const prompt = contents?.[0]?.parts?.[0]?.text;
+  if (!prompt) return err('缺少 prompt text');
 
   let dsResp;
   try {
