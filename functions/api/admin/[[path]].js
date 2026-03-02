@@ -33,9 +33,6 @@ async function getTokenData(kv, request) {
 
 async function listUsers(kv) {
   const result = await kv.list({ prefix: 'user:' });
-  // DEBUG: 返回原始结构用于诊断
-  const debugInfo = JSON.stringify({ resultKeys: result?.keys?.slice(0,2), resultType: typeof result, firstKey: result?.keys?.[0] });
-  if (!result?.keys?.length) return [{ _debug: debugInfo }];
   const keys = (result?.keys || []).map(k => k.name || k.key || k);
   const users = [];
   const batchSize = 20;
