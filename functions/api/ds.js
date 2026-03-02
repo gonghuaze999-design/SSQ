@@ -91,11 +91,16 @@ export async function onRequest(context) {
   let body;
   try { body = await request.json(); } catch { return err('Invalid JSON'); }
 
-  const { promptData, contents, model = DEFAULT_MODEL } = body;
+  const { promptData, contents, b64, model = DEFAULT_MODEL } = body;
 
-  // 服务端拼接prompt（新格式）
   let prompt = '';
-  if (promptData) {
+  if (b64) {
+    try {
+      prompt = decodeURIComponent(escape(atob(b64)));
+    } catch(e) {
+      return err('base64解码失败');
+    }
+  } else if (promptData) {
     if (promptData.type === 'ssq_analysis') {
       prompt = buildSsqAnalysisPrompt(promptData);
     } else if (promptData.type === 'ssq_autopilot') {
@@ -104,7 +109,6 @@ export async function onRequest(context) {
       return err('未知的promptData类型');
     }
   } else if (contents && Array.isArray(contents)) {
-    // 兼容旧格式
     prompt = contents?.[0]?.parts?.[0]?.text;
   }
 
