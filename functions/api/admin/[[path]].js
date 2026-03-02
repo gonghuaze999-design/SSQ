@@ -150,7 +150,7 @@ export async function onRequest(context) {
   if (path.endsWith('/upgrade/list') && request.method === 'GET') {
     if (!isSuperadmin) return err('权限不足', 403);
     const result = await kv.list({ prefix: 'upgrade:' });
-    const keys = (result?.keys || []).map(k => k.name);
+    const keys = (result?.keys || []).map(k => k.name || k.key || String(k));
     const raws = await Promise.all(keys.map(k => kv.get(k)));
     const reqs = raws.filter(Boolean).map(r => JSON.parse(r));
     reqs.sort((a, b) => b.requestedAt - a.requestedAt);
@@ -214,7 +214,7 @@ export async function onRequest(context) {
     const result = await kv.list({ prefix, limit });
 
     // 并发读取，最多20个并发
-    const keys = (result?.keys || []).map(k => k.name);
+    const keys = (result?.keys || []).map(k => k.name || k.key || String(k));
     const logs = [];
     const batchSize = 20;
     for (let i = 0; i < keys.length; i += batchSize) {
