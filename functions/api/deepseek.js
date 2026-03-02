@@ -1,8 +1,8 @@
 // POST /api/deepseek - 代理转发 DeepSeek API 请求（key内置，用户无需配置）
-// Body: { prompt: string, model?: string }
+// Body: { data: string (base64编码的prompt), model?: string }
 
 const DEEPSEEK_API_KEY = 'sk-c648e93d82474a0880eda01639b1965f';
-const DEFAULT_MODEL = 'deepseek-chat'; // DeepSeek V3，速度快价格低
+const DEFAULT_MODEL = 'deepseek-chat';
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -16,6 +16,7 @@ function jsonRes(data, status = 200) {
     headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
   });
 }
+const ok = (data) => jsonRes({ code: 0, message: 'success', data });
 const err = (msg, status = 400) => jsonRes({ code: -1, message: msg, data: null }, status);
 const opts = () => new Response(null, { status: 204, headers: CORS_HEADERS });
 
@@ -36,17 +37,30 @@ export async function onRequest(context) {
   if (request.method === 'OPTIONS') return opts();
   if (request.method !== 'POST') return err('Method not allowed', 405);
 
-  // 验证登录
-  const kv = (typeof env !== 'undefined' ? env.SSQ_KV : null) || SSQ_KV;
+  let kv = null;
+  try { kv = env?.SSQ_KV || null; } catch(e) {}
+  try { if (!kv) kv = SSQ_KV; } catch(e) {}
   if (!kv) return err('KV Storage not configured', 500);
+
   const td = await getTokenData(kv, request);
   if (td.error) return err(td.error, 401);
 
   let body;
   try { body = await request.json(); } catch { return err('Invalid JSON'); }
 
-  const { prompt, model = DEFAULT_MODEL } = body;
-  if (!prompt) return err('缺少 prompt');
+  // data字段是base64编码的prompt
+  const { data: encodedData, model = DEFAULT_MODEL } = body;
+  if (!encodedData) return err('缺少 data');
+
+  // base64解码还原prompt
+  let prompt;
+  try {
+    prompt = atob(encodedData);
+    // atob处理的是Latin1，需要处理UTF-8中文
+    prompt = decodeURIComponent(escape(prompt));
+  } catch(e) {
+    return err('data解码失败: ' + e.message);
+  }
 
   let dsResp;
   try {
@@ -59,7 +73,7 @@ export async function onRequest(context) {
       body: JSON.stringify({
         model,
         messages: [{ role: 'user', content: prompt }],
-        max_tokens: 2048,
+        max_tokens: 8192,
         temperature: 0.6,
       }),
     });
@@ -78,5 +92,5 @@ export async function onRequest(context) {
   const text = parsed?.choices?.[0]?.message?.content || '';
   if (!text) return err('DeepSeek返回内容为空', 502);
 
-  return jsonRes({ code: 0, message: 'success', data: { text } });
+  return ok({ text });
 }
