@@ -1,5 +1,5 @@
 // POST /api/deepseek - 代理转发 DeepSeek API 请求（key内置）
-// Body: { data: string } data是前端用CompressionStream gzip压缩后base64编码的prompt
+// Body: { prompt: string }
 
 const DEEPSEEK_API_KEY = 'sk-c648e93d82474a0880eda01639b1965f';
 const DEFAULT_MODEL = 'deepseek-chat';
@@ -32,14 +32,6 @@ async function getTokenData(kv, request) {
   return td;
 }
 
-// base64 → Uint8Array
-function b64ToBytes(b64) {
-  const bin = atob(b64);
-  const arr = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return arr;
-}
-
 export async function onRequest(context) {
   const { request, env } = context;
   if (request.method === 'OPTIONS') return opts();
@@ -56,32 +48,8 @@ export async function onRequest(context) {
   let body;
   try { body = await request.json(); } catch { return err('Invalid JSON'); }
 
-  const { data: encodedData, model = DEFAULT_MODEL } = body;
-  if (!encodedData) return err('缺少 data');
-
-  // gzip解压
-  let prompt;
-  try {
-    const compressed = b64ToBytes(encodedData);
-    const ds = new DecompressionStream('gzip');
-    const writer = ds.writable.getWriter();
-    writer.write(compressed);
-    writer.close();
-    const chunks = [];
-    const reader = ds.readable.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-    }
-    const total = chunks.reduce((a, c) => a + c.length, 0);
-    const merged = new Uint8Array(total);
-    let offset = 0;
-    for (const c of chunks) { merged.set(c, offset); offset += c.length; }
-    prompt = new TextDecoder().decode(merged);
-  } catch(e) {
-    return err('data解压失败: ' + e.message);
-  }
+  const { prompt, model = DEFAULT_MODEL } = body;
+  if (!prompt) return err('缺少 prompt');
 
   let dsResp;
   try {
