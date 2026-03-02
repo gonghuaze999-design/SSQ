@@ -33,7 +33,7 @@ async function getTokenData(kv, request) {
 
 async function listUsers(kv) {
   const result = await kv.list({ prefix: 'user:' });
-  const keys = result.keys.map(k => k.name);
+  const keys = (result?.keys || []).map(k => k.name);
   const users = [];
   const batchSize = 20;
   for (let i = 0; i < keys.length; i += batchSize) {
@@ -149,7 +149,7 @@ export async function onRequest(context) {
   if (path.endsWith('/upgrade/list') && request.method === 'GET') {
     if (!isSuperadmin) return err('权限不足', 403);
     const result = await kv.list({ prefix: 'upgrade:' });
-    const keys = result.keys.map(k => k.name);
+    const keys = (result?.keys || []).map(k => k.name);
     const raws = await Promise.all(keys.map(k => kv.get(k)));
     const reqs = raws.filter(Boolean).map(r => JSON.parse(r));
     reqs.sort((a, b) => b.requestedAt - a.requestedAt);
@@ -213,7 +213,7 @@ export async function onRequest(context) {
     const result = await kv.list({ prefix, limit });
 
     // 并发读取，最多20个并发
-    const keys = result.keys.map(k => k.name);
+    const keys = (result?.keys || []).map(k => k.name);
     const logs = [];
     const batchSize = 20;
     for (let i = 0; i < keys.length; i += batchSize) {
@@ -331,7 +331,7 @@ export async function onRequest(context) {
       : (targetUser ? `bt_rec:${targetUser}:` : 'bt_rec:');
     const result = await kv.list({ prefix, limit });
     const records = [];
-    for (const k of result.keys) {
+    for (const k of (result?.keys || [])) {
       const raw = await kv.get(k.name);
       if (raw) records.push(JSON.parse(raw));
     }
