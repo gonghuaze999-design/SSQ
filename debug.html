@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>SSQ 诊断</title>
+<style>
+body{font-family:monospace;padding:20px;background:#1a1a2e;color:#eee}
+.box{background:#16213e;padding:15px;border-radius:8px;margin:10px 0;white-space:pre-wrap;word-break:break-all}
+button{background:#7c83fd;color:white;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;margin:5px;font-size:14px}
+</style>
+</head>
+<body>
+<h2>SSQ 诊断 — 测试真实prompt内容</h2>
+<p>目标：找到真实AI prompt里触发545的具体内容</p>
+<button onclick="testReal()">真实AI prompt片段</button>
+<button onclick="testNums()">只含数字和空格</button>
+<button onclick="testMixed()">中文+数字混合（非重复）</button>
+<div class="box" id="result">点击按钮测试</div>
+<script>
+const TOKEN_KEY = 'ssq_token_v1';
+
+// 模拟真实彩票prompt的结构（非重复内容）
+const REAL_PROMPT = `你是资深彩票数据分析师。以下是双色球历史数据：
+期号,红球,蓝球
+2026005,03 08 12 19 24 31,07
+2026004,01 05 11 17 22 28,03
+2026003,02 07 14 18 25 30,09
+2026002,04 09 13 20 26 29,11
+2026001,06 10 15 21 27 33,05
+2025100,03 11 16 22 28 32,08
+2025099,01 08 14 19 25 31,04
+2025098,05 09 12 18 24 30,06
+2025097,02 07 13 20 26 33,10
+2025096,04 10 15 21 27 29,12
+请分析以上数据，生成AI研判报告。`;
+
+const NUMS_PROMPT = '03 08 12 19 24 31 07\n'.repeat(50) + '请分析';
+const MIXED_PROMPT = `分析师报告：第2026期双色球开奖号码为03 08 12 19 24 31蓝07。
+历史统计显示红球03出现47次，08出现52次，12出现49次。
+蓝球07在近100期中出现8次，属于热号。
+综合分析建议关注：03 11 17 22 28 33，蓝球推荐07。`;
+
+async function send(prompt, label) {
+  const token = localStorage.getItem(TOKEN_KEY);
+  const bodyStr = JSON.stringify({ prompt });
+  document.getElementById('result').textContent = '请求中... [' + label + '] ' + prompt.length + '字符';
+  try {
+    const res = await fetch('/api/deepseek', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (token||'') },
+      body: bodyStr
+    });
+    const text = await res.text();
+    document.getElementById('result').textContent = '[' + label + ']\nStatus: ' + res.status + '\n' + prompt.length + '字符\n\n' + text.slice(0, 400);
+  } catch(e) {
+    document.getElementById('result').textContent = '异常: ' + e.message;
+  }
+}
+
+function testReal() { send(REAL_PROMPT, '真实prompt'); }
+function testNums() { send(NUMS_PROMPT, '数字重复'); }
+function testMixed() { send(MIXED_PROMPT, '中文+数字非重复'); }
+</script>
+</body>
+</html>
