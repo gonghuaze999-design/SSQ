@@ -65,6 +65,7 @@ export async function onRequest(context) {
   const { request, env } = context;
   if (request.method === 'OPTIONS') return opts();
 
+  try {
   let kv = null;
   try { kv = env?.SSQ_KV || null; } catch(e) {}
   try { if (!kv) kv = SSQ_KV; } catch(e) {}
@@ -350,4 +351,7 @@ export async function onRequest(context) {
   }
 
   return err('Not Found', 404);
+  } catch(e) {
+    return err('Internal error: ' + (e?.message || String(e)), 500);
+  }
 }
